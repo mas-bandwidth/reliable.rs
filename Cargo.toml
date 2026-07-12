@@ -1,0 +1,14 @@
+[package]
+name = "reliable"
+version = "1.3.4"
+edition = "2024"
+rust-version = "1.88"
+authors = ["Glenn Fiedler <glenn@mas-bandwidth.com>"]
+description = "A simple packet acknowledgement system for UDP-based protocols"
+license = "BSD-3-Clause"
+repository = "https://github.com/mas-bandwidth/reliable.rs"
+keywords = ["networking", "udp", "gamedev", "acks", "protocol"]
+categories = ["network-programming", "game-development"]
+
+[dependencies]
+log = "0.4"

@@ -265,6 +265,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn packet_header_roundtrip_random() {
+        // randomized roundtrip: any (sequence, ack, ack_bits) triple must survive
+        // write/read exactly, whichever variable-length encoding it takes
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut packet_data = [0u8; MAX_PACKET_HEADER_BYTES];
+        for _ in 0..100_000 {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            let random = state.wrapping_mul(0x2545_F491_4F6C_DD1D);
+
+            let sequence = random as u16;
+            let ack = (random >> 16) as u16;
+            let ack_bits = (random >> 32) as u32;
+
+            let bytes_written = write_packet_header(&mut packet_data, sequence, ack, ack_bits);
+            let header = read_packet_header("roundtrip", &packet_data[..bytes_written])
+                .expect("read packet header");
+            assert_eq!(header.bytes, bytes_written);
+            assert_eq!(header.sequence, sequence);
+            assert_eq!(header.ack, ack);
+            assert_eq!(header.ack_bits, ack_bits);
+        }
+    }
+
+    #[test]
     fn packet_header() {
         let mut packet_data = [0u8; MAX_PACKET_HEADER_BYTES];
 

@@ -7,6 +7,9 @@ authors = ["Glenn Fiedler <glenn@mas-bandwidth.com>"]
 description = "A simple packet acknowledgement system for UDP-based protocols"
 license = "BSD-3-Clause"
 repository = "https://github.com/mas-bandwidth/reliable.rs"
+documentation = "https://docs.rs/reliable"
+readme = "README.md"
+exclude = [".github/", "fuzz/"]
 keywords = ["networking", "udp", "gamedev", "acks", "protocol"]
 categories = ["network-programming", "game-development"]
 

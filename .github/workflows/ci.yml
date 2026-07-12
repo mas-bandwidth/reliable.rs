@@ -32,3 +32,47 @@ jobs:
       - run: rustup update stable && rustup default stable && rustup component add rustfmt clippy
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
+
+  docs:
+    name: docs
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup update stable && rustup default stable
+      - run: cargo doc --no-deps
+
+  msrv:
+    name: msrv (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.88 --profile minimal && rustup default 1.88
+      - run: cargo build --all-targets
+      - run: cargo test
+
+  package:
+    name: cargo package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup update stable && rustup default stable
+      - run: cargo publish --dry-run
+
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@cargo-audit
+      - run: cargo audit
+
+  fuzz:
+    name: fuzz (smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install nightly --profile minimal && rustup default nightly
+      - uses: taiki-e/install-action@cargo-fuzz
+      - run: cargo fuzz run fuzz_endpoint -- -max_total_time=60

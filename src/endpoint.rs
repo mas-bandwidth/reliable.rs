@@ -65,24 +65,39 @@ impl Default for Config {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Counters {
+    /// Packets sent through the endpoint.
     pub num_packets_sent: u64,
+    /// Packets received by the endpoint, including invalid, stale and duplicate packets.
     pub num_packets_received: u64,
+    /// Sent packets acked by the other side.
     pub num_packets_acked: u64,
+    /// Received packets dropped because they fell outside the receive window.
     pub num_packets_stale: u64,
+    /// Received packets dropped because their header could not be read.
     pub num_packets_invalid: u64,
+    /// Packets rejected by [`Endpoint::send_packet`] for exceeding [`Config::max_packet_size`].
     pub num_packets_too_large_to_send: u64,
+    /// Received packets dropped for exceeding [`Config::max_packet_size`].
     pub num_packets_too_large_to_receive: u64,
+    /// Fragments sent (fragmented packets also count once in `num_packets_sent`).
     pub num_fragments_sent: u64,
+    /// Fragments received and stored for reassembly.
     pub num_fragments_received: u64,
+    /// Fragments dropped because their header was invalid or they could not be buffered.
     pub num_fragments_invalid: u64,
+    /// Received packets dropped because a packet with the same sequence number was
+    /// already received.
     pub num_packets_duplicate: u64,
 }
 
 /// Bandwidth statistics, in kilobits per-second.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Bandwidth {
+    /// Outgoing bandwidth over the sent packet window.
     pub sent_kbps: f32,
+    /// Incoming bandwidth over the received packet window.
     pub received_kbps: f32,
+    /// Outgoing bandwidth restricted to packets that were acked.
     pub acked_kbps: f32,
 }
 
@@ -678,6 +693,15 @@ impl Endpoint {
     /// last clear or drain, leaving the array empty. A one-call alternative to
     /// [`acks`](Self::acks) followed by [`clear_acks`](Self::clear_acks) that makes the
     /// clear impossible to forget.
+    ///
+    /// ```
+    /// # use reliable::{Config, Endpoint};
+    /// # let mut endpoint = Endpoint::new(Config::default(), 0.0);
+    /// for _acked_sequence in endpoint.drain_acks() {
+    ///     // resend-tracking for this packet can be released
+    /// }
+    /// assert!(endpoint.acks().is_empty());
+    /// ```
     pub fn drain_acks(&mut self) -> impl Iterator<Item = u16> + '_ {
         self.acks.drain(..)
     }

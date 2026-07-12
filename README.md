@@ -120,6 +120,8 @@ cargo build
 cargo test
 ```
 
+The minimum supported Rust version is 1.88. The crate contains no unsafe code (`#![forbid(unsafe_code)]`) and its only dependency is the [`log`](https://crates.io/crates/log) facade.
+
 The test suite includes the C library's tests ported one for one, plus bounded runs of its soak harness (randomly sized fragmented packets over a lossy link, contents validated) and its fuzz harness (loss, reordering, duplication, bit corruption and random packet injection over a simulated link).
 
 The C repo's example programs are ported under [examples](examples):
@@ -130,6 +132,17 @@ cargo run --example stats
 cargo run --example soak -- 8192 --quiet
 cargo run --example fuzz -- 100000 12345
 ```
+
+# Fuzzing
+
+The C repo's libFuzzer harness (`fuzz_target.c`) is ported as a [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) target. The fuzz input is a script of send/inject operations against a live endpoint pair, so coverage-guided fuzzing reaches the header parser, fragment reassembly, ack processing and stale/duplicate rejection:
+
+```
+cargo install cargo-fuzz
+cargo +nightly fuzz run fuzz_endpoint
+```
+
+CI runs a one minute fuzz smoke test on every push, and a scheduled workflow fuzzes for 30 minutes weekly.
 
 # Caveats
 

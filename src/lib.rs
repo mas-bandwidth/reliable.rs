@@ -77,6 +77,9 @@
 //! logs through the [`log`] crate facade: install any logger implementation and enable
 //! the `Debug` level to see per-packet detail.
 
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
 mod endpoint;
 mod packet;
 mod sequence_buffer;

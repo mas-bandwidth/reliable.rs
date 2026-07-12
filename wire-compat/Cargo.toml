@@ -1,0 +1,13 @@
+[package]
+name = "reliable-wire-compat"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[dependencies]
+reliable = { path = ".." }
+
+[build-dependencies]
+cc = "1"
+
+[workspace]

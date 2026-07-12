@@ -20,7 +20,10 @@ fuzz_target!(|data: &[u8]| {
     let mut time = 100.0;
 
     // fragment aggressively so reassembly is exercised by small inputs
-    let config = Config { fragment_above: 500, ..Config::default() };
+    let config = Config {
+        fragment_above: 500,
+        ..Config::default()
+    };
 
     let mut client = Endpoint::new(config.clone(), time);
     let mut server = Endpoint::new(config, time);

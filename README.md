@@ -67,6 +67,8 @@ Once you process all acks, clear them:
 endpoint.clear_acks();
 ```
 
+Or do both in one call with `endpoint.drain_acks()`, which yields the acked sequence numbers and leaves the array empty.
+
 Before you send a packet, you can ask reliable what sequence number the sent packet will have:
 
 ```rust
@@ -131,6 +133,17 @@ cargo run --example example
 cargo run --example stats
 cargo run --example soak -- 8192 --quiet
 cargo run --example fuzz -- 100000 12345
+```
+
+# Wire compatibility
+
+Wire compatibility with the C library is a locked-in invariant, not a one-time claim. The [wire-compat](wire-compat) test crate vendors the C reference implementation (pinned at 1.3.4) and links it directly into the test binary via FFI. On every push and pull request, on Linux, macOS and Windows, CI verifies that:
+
+1. A Rust endpoint and a C endpoint exchanging bidirectional traffic (regular and fragmented) deliver every payload intact and ack everything the other sent.
+2. A Rust endpoint pair and a C endpoint pair driven through the same deterministic exchange put **byte-identical** datagrams on the wire.
+
+```
+cargo test --manifest-path wire-compat/Cargo.toml
 ```
 
 # Fuzzing

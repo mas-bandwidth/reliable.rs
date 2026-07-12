@@ -9,7 +9,7 @@ license = "BSD-3-Clause"
 repository = "https://github.com/mas-bandwidth/reliable.rs"
 documentation = "https://docs.rs/reliable"
 readme = "README.md"
-exclude = [".github/", "fuzz/"]
+exclude = [".github/", "fuzz/", "wire-compat/"]
 keywords = ["networking", "udp", "gamedev", "acks", "protocol"]
 categories = ["network-programming", "game-development"]
 

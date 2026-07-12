@@ -73,6 +73,9 @@
 //! endpoint.clear_acks();
 //! ```
 //!
+//! [`Endpoint::drain_acks`] yields the acked sequence numbers and clears them in one
+//! call, if you prefer not to keep the two steps in sync.
+//!
 //! In place of the C library's process-wide log level and printf function, this crate
 //! logs through the [`log`] crate facade: install any logger implementation and enable
 //! the `Debug` level to see per-packet detail.

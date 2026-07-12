@@ -16,7 +16,7 @@ jobs:
         with:
           tool: cargo-fuzz
       - run: cargo fuzz run fuzz_endpoint --target x86_64-unknown-linux-gnu -- -max_total_time=1800
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: fuzz-artifacts

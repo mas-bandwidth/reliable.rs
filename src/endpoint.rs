@@ -63,6 +63,7 @@ impl Default for Config {
 
 /// Counters tracked by an [`Endpoint`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Counters {
     pub num_packets_sent: u64,
     pub num_packets_received: u64,
@@ -120,43 +121,46 @@ impl Default for FragmentReassemblyData {
     }
 }
 
-fn store_fragment_data(
-    reassembly_data: &mut FragmentReassemblyData,
-    sequence: u16,
-    ack: u16,
-    ack_bits: u32,
-    fragment_id: usize,
-    fragment_size: usize,
-    mut fragment_data: &[u8],
-) {
-    if fragment_id == 0 {
-        let mut packet_header = [0u8; MAX_PACKET_HEADER_BYTES];
-        let packet_header_bytes = write_packet_header(&mut packet_header, sequence, ack, ack_bits);
-        reassembly_data.packet_header_bytes = packet_header_bytes;
-        reassembly_data.packet_data
-            [MAX_PACKET_HEADER_BYTES - packet_header_bytes..MAX_PACKET_HEADER_BYTES]
-            .copy_from_slice(&packet_header[..packet_header_bytes]);
-        fragment_data = &fragment_data[packet_header_bytes..];
-    }
+impl FragmentReassemblyData {
+    fn store_fragment(
+        &mut self,
+        sequence: u16,
+        ack: u16,
+        ack_bits: u32,
+        fragment_id: usize,
+        fragment_size: usize,
+        mut fragment_data: &[u8],
+    ) {
+        if fragment_id == 0 {
+            let mut packet_header = [0u8; MAX_PACKET_HEADER_BYTES];
+            let packet_header_bytes =
+                write_packet_header(&mut packet_header, sequence, ack, ack_bits);
+            self.packet_header_bytes = packet_header_bytes;
+            self.packet_data
+                [MAX_PACKET_HEADER_BYTES - packet_header_bytes..MAX_PACKET_HEADER_BYTES]
+                .copy_from_slice(&packet_header[..packet_header_bytes]);
+            fragment_data = &fragment_data[packet_header_bytes..];
+        }
 
-    if fragment_id == reassembly_data.num_fragments_total - 1 {
-        reassembly_data.packet_bytes =
-            (reassembly_data.num_fragments_total - 1) * fragment_size + fragment_data.len();
-    }
+        if fragment_id == self.num_fragments_total - 1 {
+            self.packet_bytes =
+                (self.num_fragments_total - 1) * fragment_size + fragment_data.len();
+        }
 
-    let offset = MAX_PACKET_HEADER_BYTES + fragment_id * fragment_size;
-    let end_offset = offset + fragment_data.len();
-    if end_offset > reassembly_data.packet_data.len() {
-        debug!(
-            "[reliable] invalid fragment size {} (would write past {}/{})",
-            fragment_data.len(),
-            end_offset,
-            reassembly_data.packet_data.len()
-        );
-        return;
-    }
+        let offset = MAX_PACKET_HEADER_BYTES + fragment_id * fragment_size;
+        let end_offset = offset + fragment_data.len();
+        if end_offset > self.packet_data.len() {
+            debug!(
+                "[reliable] invalid fragment size {} (would write past {}/{})",
+                fragment_data.len(),
+                end_offset,
+                self.packet_data.len()
+            );
+            return;
+        }
 
-    reassembly_data.packet_data[offset..end_offset].copy_from_slice(fragment_data);
+        self.packet_data[offset..end_offset].copy_from_slice(fragment_data);
+    }
 }
 
 fn smoothed_bandwidth_kbps<T: Default>(
@@ -168,7 +172,7 @@ fn smoothed_bandwidth_kbps<T: Default>(
     let base_sequence = buffer.sequence().wrapping_sub(buffer.num_entries() as u16);
     let num_samples = buffer.num_entries() / 2;
     let mut bytes_sent: u64 = 0;
-    let mut start_time = f64::from(f32::MAX);
+    let mut start_time: Option<f64> = None;
     let mut finish_time = 0.0;
     for i in 0..num_samples {
         let Some(entry) = buffer.find(base_sequence.wrapping_add(i as u16)) else {
@@ -178,14 +182,16 @@ fn smoothed_bandwidth_kbps<T: Default>(
             continue;
         };
         bytes_sent += u64::from(packet_bytes);
-        if time < start_time {
-            start_time = time;
+        if start_time.is_none_or(|start_time| time < start_time) {
+            start_time = Some(time);
         }
         if time > finish_time {
             finish_time = time;
         }
     }
-    if start_time != f64::from(f32::MAX) && finish_time > start_time {
+    if let Some(start_time) = start_time
+        && finish_time > start_time
+    {
         let kbps = (bytes_sent as f64 / (finish_time - start_time) * 8.0 / 1000.0) as f32;
         if (current_kbps - kbps).abs() > 0.00001 {
             current_kbps + (kbps - current_kbps) * smoothing_factor
@@ -200,8 +206,8 @@ fn smoothed_bandwidth_kbps<T: Default>(
 /// A reliable endpoint.
 ///
 /// One endpoint per connection: a client has one, a server has one per client slot.
-/// Endpoints are not [`Sync`]: use one endpoint per-thread or protect each endpoint
-/// with your own lock.
+/// There is no locking inside: every operation takes `&mut self`, so the borrow checker
+/// enforces the C library's caveat that an endpoint must not be used concurrently.
 pub struct Endpoint {
     config: Config,
     time: f64,
@@ -288,6 +294,10 @@ impl Endpoint {
     /// `(sequence, packet_data)`, split into fragments first if larger than
     /// [`Config::fragment_above`]. The closure must not send packets on the same
     /// endpoint (the endpoint's transmit scratch buffer is in use while it runs).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `packet_data` is empty.
     pub fn send_packet(&mut self, packet_data: &[u8], mut transmit: impl FnMut(u16, &[u8])) {
         assert!(!packet_data.is_empty());
 
@@ -394,6 +404,10 @@ impl Endpoint {
     /// the `process` closure as `(sequence, packet_data)`; return true to accept and ack
     /// the packet, false to reject it (rejected packets are not acked and may be
     /// processed again if they arrive again). Stale and duplicate packets are dropped.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `packet_data` is empty.
     pub fn receive_packet(
         &mut self,
         packet_data: &[u8],
@@ -616,8 +630,7 @@ impl Endpoint {
             reassembly_data.num_fragments_received += 1;
             reassembly_data.fragment_received[fragment_header.fragment_id] = true;
 
-            store_fragment_data(
-                reassembly_data,
+            reassembly_data.store_fragment(
                 fragment_header.sequence,
                 fragment_header.ack,
                 fragment_header.ack_bits,
@@ -659,6 +672,14 @@ impl Endpoint {
     /// don't, the ack buffer fills up and new acks are dropped.
     pub fn clear_acks(&mut self) {
         self.acks.clear();
+    }
+
+    /// Drains the ack array: yields the sequence numbers of sent packets acked since the
+    /// last clear or drain, leaving the array empty. A one-call alternative to
+    /// [`acks`](Self::acks) followed by [`clear_acks`](Self::clear_acks) that makes the
+    /// clear impossible to forget.
+    pub fn drain_acks(&mut self) -> impl Iterator<Item = u16> + '_ {
+        self.acks.drain(..)
     }
 
     /// Resets the endpoint to its initial state: acks, counters, sequence number and all
@@ -855,11 +876,22 @@ impl Endpoint {
     }
 }
 
+impl std::fmt::Debug for Endpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Endpoint")
+            .field("name", &self.config.name)
+            .field("time", &self.time)
+            .field("next_packet_sequence", &self.sequence)
+            .field("num_acks", &self.acks.len())
+            .field("counters", &self.counters)
+            .finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::needless_range_loop)]
 mod tests {
     use super::*;
-    use crate::sequence_buffer::ENTRY_EMPTY;
 
     const TEST_ACKS_NUM_ITERATIONS: usize = 256;
     const TEST_MAX_PACKET_BYTES: usize = 4 * 1024;
@@ -1319,7 +1351,7 @@ mod tests {
         assert!(!receiver.fragment_reassembly.exists(0));
         for index in 0..receiver.fragment_reassembly.num_entries() {
             let (entry_sequence, entry) = receiver.fragment_reassembly.raw_entry(index);
-            if entry_sequence == ENTRY_EMPTY {
+            if entry_sequence.is_none() {
                 assert!(entry.packet_data.is_empty());
             }
         }
@@ -1393,7 +1425,7 @@ mod tests {
 
         for index in 0..receiver.fragment_reassembly.num_entries() {
             let (entry_sequence, entry) = receiver.fragment_reassembly.raw_entry(index);
-            assert_eq!(entry_sequence, ENTRY_EMPTY);
+            assert_eq!(entry_sequence, None);
             assert!(entry.packet_data.is_empty());
         }
 

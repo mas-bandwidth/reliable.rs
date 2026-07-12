@@ -1,12 +1,12 @@
 use crate::{sequence_greater_than, sequence_less_than};
 
-pub(crate) const ENTRY_EMPTY: u32 = 0xFFFF_FFFF;
-
 /// A circular buffer of entries indexed by u16 sequence number. This is the core data
 /// structure used to track sent packets, received packets and packets under reassembly.
+/// (Where the C library marks empty slots with a 0xFFFFFFFF sentinel in a u32 array,
+/// this port stores `Option<u16>` — the same four bytes per slot, without the sentinel.)
 pub(crate) struct SequenceBuffer<T> {
     sequence: u16,
-    entry_sequence: Vec<u32>,
+    entry_sequence: Vec<Option<u16>>,
     entries: Vec<T>,
 }
 
@@ -15,7 +15,7 @@ impl<T: Default> SequenceBuffer<T> {
         assert!(num_entries > 0);
         Self {
             sequence: 0,
-            entry_sequence: vec![ENTRY_EMPTY; num_entries],
+            entry_sequence: vec![None; num_entries],
             entries: std::iter::repeat_with(T::default)
                 .take(num_entries)
                 .collect(),
@@ -33,7 +33,7 @@ impl<T: Default> SequenceBuffer<T> {
 
     pub fn reset(&mut self) {
         self.sequence = 0;
-        self.entry_sequence.fill(ENTRY_EMPTY);
+        self.entry_sequence.fill(None);
         for entry in &mut self.entries {
             *entry = T::default();
         }
@@ -48,12 +48,12 @@ impl<T: Default> SequenceBuffer<T> {
         }
         if finish - start < num_entries {
             for sequence in start..=finish {
-                self.entry_sequence[sequence % num_entries] = ENTRY_EMPTY;
+                self.entry_sequence[sequence % num_entries] = None;
                 self.entries[sequence % num_entries] = T::default();
             }
         } else {
             for index in 0..num_entries {
-                self.entry_sequence[index] = ENTRY_EMPTY;
+                self.entry_sequence[index] = None;
                 self.entries[index] = T::default();
             }
         }
@@ -82,7 +82,7 @@ impl<T: Default> SequenceBuffer<T> {
             self.sequence = sequence.wrapping_add(1);
         }
         let index = sequence as usize % self.entries.len();
-        self.entry_sequence[index] = sequence as u32;
+        self.entry_sequence[index] = Some(sequence);
         self.entries[index] = T::default();
         Some(&mut self.entries[index])
     }
@@ -103,7 +103,7 @@ impl<T: Default> SequenceBuffer<T> {
             return None;
         }
         let index = sequence as usize % self.entries.len();
-        self.entry_sequence[index] = sequence as u32;
+        self.entry_sequence[index] = Some(sequence);
         self.entries[index] = T::default();
         Some(&mut self.entries[index])
     }
@@ -119,19 +119,19 @@ impl<T: Default> SequenceBuffer<T> {
 
     pub fn remove(&mut self, sequence: u16) {
         let index = sequence as usize % self.entries.len();
-        if self.entry_sequence[index] != ENTRY_EMPTY {
-            self.entry_sequence[index] = ENTRY_EMPTY;
+        if self.entry_sequence[index].is_some() {
+            self.entry_sequence[index] = None;
             self.entries[index] = T::default();
         }
     }
 
     pub fn exists(&self, sequence: u16) -> bool {
-        self.entry_sequence[sequence as usize % self.entries.len()] == sequence as u32
+        self.entry_sequence[sequence as usize % self.entries.len()] == Some(sequence)
     }
 
     pub fn find(&self, sequence: u16) -> Option<&T> {
         let index = sequence as usize % self.entries.len();
-        if self.entry_sequence[index] == sequence as u32 {
+        if self.entry_sequence[index] == Some(sequence) {
             Some(&self.entries[index])
         } else {
             None
@@ -140,7 +140,7 @@ impl<T: Default> SequenceBuffer<T> {
 
     pub fn find_mut(&mut self, sequence: u16) -> Option<&mut T> {
         let index = sequence as usize % self.entries.len();
-        if self.entry_sequence[index] == sequence as u32 {
+        if self.entry_sequence[index] == Some(sequence) {
             Some(&mut self.entries[index])
         } else {
             None
@@ -163,7 +163,7 @@ impl<T: Default> SequenceBuffer<T> {
     }
 
     #[cfg(test)]
-    pub fn raw_entry(&self, index: usize) -> (u32, &T) {
+    pub fn raw_entry(&self, index: usize) -> (Option<u16>, &T) {
         (self.entry_sequence[index], &self.entries[index])
     }
 }

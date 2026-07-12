@@ -1,4 +1,6 @@
 [![CI](https://github.com/mas-bandwidth/reliable.rs/actions/workflows/ci.yml/badge.svg)](https://github.com/mas-bandwidth/reliable.rs/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/reliable.svg)](https://crates.io/crates/reliable)
+[![docs.rs](https://img.shields.io/docsrs/reliable)](https://docs.rs/reliable)
 
 # Introduction
 

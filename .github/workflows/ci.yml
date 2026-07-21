@@ -92,3 +92,30 @@ jobs:
         with:
           tool: cargo-fuzz
       - run: cargo fuzz run fuzz_endpoint --target x86_64-unknown-linux-gnu -- -max_total_time=60
+
+  spec-sync:
+    name: STANDARD.md matches upstream
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # STANDARD.md here is a VERBATIM VENDORED COPY of the wire-format
+      # specification that lives in mas-bandwidth/reliable. This job fails if the
+      # two have diverged.
+      #
+      # Why vendor rather than link: an implementer wants the normative text
+      # beside the implementation, at the revision they are reading. Why check:
+      # a duplicated normative document is the same failure as a duplicated
+      # constant, except it drifts silently and the ports are what break.
+      #
+      # If this fails, the upstream spec changed. Read the diff, port whatever
+      # it implies, then copy the new file across in the same commit.
+      - name: Compare against mas-bandwidth/reliable
+        run: |
+          curl -fsSL -o /tmp/upstream-STANDARD.md \
+            https://raw.githubusercontent.com/mas-bandwidth/reliable/main/STANDARD.md
+          if ! diff -u /tmp/upstream-STANDARD.md STANDARD.md; then
+            echo "::error::STANDARD.md has diverged from mas-bandwidth/reliable"
+            exit 1
+          fi
+          echo "STANDARD.md matches upstream"

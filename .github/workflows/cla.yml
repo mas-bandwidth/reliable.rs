@@ -30,8 +30,27 @@ jobs:
   caa:
     runs-on: ubuntu-latest
     steps:
+      # `recheck` re-runs the check; it records nothing by itself, it just makes
+      # the action re-read this PR's commit authors and the signature ledger and
+      # restate the verdict. It has to be accepted here because the action
+      # advertises it unprompted -- `suggest-recheck` defaults to true, so every
+      # "please sign" comment it posts ends with "You can retrigger this bot by
+      # commenting recheck in this Pull Request". Without this clause that
+      # instruction does nothing: no `if` matches, so the step is never
+      # scheduled, and the contributor gets no run, no log and no error.
+      #
+      # Compared with `==` and not `contains`, deliberately: the action's own
+      # comment quotes the word `recheck`, and a substring test would let the
+      # workflow retrigger on the bot's output. Guarded on
+      # `github.event.issue.pull_request` because the action is pull-request-only
+      # and aborts on a plain issue; that guard is scoped to the `recheck` clause
+      # so this change adds no new way to reach that failure.
       - name: CAA check
-        if: (github.event.comment.body == 'I have read the CAA and I hereby sign it, assigning copyright in my contributions to Más Bandwidth LLC.') || github.event_name == 'pull_request_target'
+        if: >-
+          github.event.comment.body == 'I have read the CAA and I hereby sign it, assigning copyright in my contributions to Más Bandwidth LLC.' ||
+          (github.event.issue.pull_request != null &&
+          github.event.comment.body == 'recheck') ||
+          github.event_name == 'pull_request_target'
         uses: contributor-assistant/github-action@v2.6.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,3 +1,22 @@
+<!-- HOT:BEGIN -->
+## HOT — read before touching this repo
+
+WHAT: Rust port of mas-bandwidth/reliable, the C packet fragmentation/ack library.
+NOT mas-bandwidth/reliable (the C reference), NOT reliable.go (the Go port).
+
+PUBLISHING (crates.io) — the token is NOT on this bench
+The crates.io token lives at /Users/glenn/.cargo/credentials.toml on GLENN'S personal
+macOS account: mode 0600, owned by glenn, unreadable from the mas account. `cargo publish`
+here fails with "no token found". That is NOT a missing credential and NOT a reason to
+mint a new one — it is the wrong machine account. Either Glenn publishes from his own
+account, or he moves the token into the mas keychain with the prompting form
+(`security add-generic-password -U -a rowan -s crates-io-token -w`, no value after -w).
+
+STATE as verified 2026-07-26: crates.io has `reliable` 1.3.4 (published 2026-07-12) while
+Cargo.toml here is at 1.4.0. So this is a publish-UPDATE and the crate name is already
+ours — no name trap. `cargo publish --dry-run` packages and compiles clean.
+<!-- HOT:END -->
+
 # CLAUDE.md
 
 ## What this is

@@ -16,7 +16,8 @@ pub struct Config {
     pub max_packet_size: usize,
     /// Packets larger than this many bytes are sent as fragments.
     pub fragment_above: usize,
-    /// Maximum number of fragments per-packet. 256 max. Must cover max_packet_size / fragment_size.
+    /// Maximum number of fragments per-packet. 256 max. Must be large enough to cover
+    /// `max_packet_size` at `fragment_size` bytes per fragment.
     pub max_fragments: usize,
     /// Size of each fragment (bytes).
     pub fragment_size: usize,
@@ -254,13 +255,18 @@ impl Endpoint {
     ///
     /// # Panics
     ///
-    /// Panics if the config is invalid: zero sizes, or `max_fragments > 256`.
+    /// Panics if the config is invalid: zero sizes, `max_fragments > 256`,
+    /// `fragment_above > max_packet_size`, or insufficient fragment capacity.
     pub fn new(config: Config, time: f64) -> Self {
         assert!(config.max_packet_size > 0);
         assert!(config.fragment_above > 0);
         assert!(config.max_fragments > 0);
         assert!(config.max_fragments <= 256);
         assert!(config.fragment_size > 0);
+        assert!(config.fragment_above <= config.max_packet_size);
+        // max_fragments * fragment_size must cover max_packet_size. Compare using
+        // division because the product could overflow usize.
+        assert!(config.max_fragments > (config.max_packet_size - 1) / config.fragment_size);
         assert!(config.ack_buffer_size > 0);
         assert!(config.sent_packets_buffer_size > 0);
         assert!(config.received_packets_buffer_size > 0);
@@ -925,6 +931,57 @@ mod tests {
             name: name.to_string(),
             ..Config::default()
         }
+    }
+
+    #[test]
+    #[should_panic]
+    fn endpoint_rejects_fragment_threshold_above_max_packet() {
+        Endpoint::new(
+            Config {
+                max_packet_size: 1000,
+                fragment_above: 1001,
+                ..test_config("invalid-threshold")
+            },
+            0.0,
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    fn endpoint_rejects_fragment_capacity_below_max_packet() {
+        Endpoint::new(
+            Config {
+                max_packet_size: 1001,
+                fragment_above: 1000,
+                max_fragments: 4,
+                fragment_size: 250,
+                ..test_config("invalid-capacity")
+            },
+            0.0,
+        );
+    }
+
+    #[test]
+    fn endpoint_accepts_fragment_configuration_boundaries() {
+        let mut endpoint = Endpoint::new(
+            Config {
+                max_packet_size: 1000,
+                fragment_above: 999,
+                max_fragments: 4,
+                fragment_size: 250,
+                ..test_config("valid-boundary")
+            },
+            0.0,
+        );
+
+        let packet = vec![0u8; 1000];
+        let mut transmitted = Vec::new();
+        endpoint.send_packet(&packet, |_, data| transmitted.push(data.to_vec()));
+        assert_eq!(transmitted.len(), 4);
+        assert_eq!(
+            endpoint.config().max_fragments * endpoint.config().fragment_size,
+            1000
+        );
     }
 
     fn generate_packet_data_with_size(sequence: u16, packet_bytes: usize) -> Vec<u8> {

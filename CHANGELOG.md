@@ -10,8 +10,18 @@ wire-compatibility tests run the port against it. Nothing on the wire changes: n
 release between 1.3.4 and 1.4.5 touched the packet format, and a Rust pair and a C pair
 driven through the same exchange still put byte-identical datagrams on the wire.
 
-Every upstream change from 1.4.1 through 1.4.5 is dispositioned below. The ones with a
-Rust analogue are carried; the ones without say why.
+Every upstream change from 1.3.4 — the version this port was written against — through
+1.4.5 is dispositioned below. The ones with a Rust analogue are carried; the ones
+without say why.
+
+1.3.5 and 1.4.0 come first because they are small. 1.3.5 changed no library code at all:
+it is the crediting request and the funding link. 1.4.0 removed two dead helpers,
+`reliable_read_bytes` and `reliable_write_bytes`, which were unreachable in C and were
+never written here; fixed an MSVC-hostile empty initializer in the C test driver
+(`uint8_t packet_data[TEST_MAX_PACKET_BYTES] = {}` to `= {0}`), which is C syntax with no
+Rust counterpart; and added an rtt test. 1.4.0 is also where `STANDARD.md` became a
+normative document; it is vendored in this repo verbatim, with a CI job that fails if it
+drifts from upstream.
 
 ### Carried into the port
 
@@ -35,8 +45,26 @@ Rust analogue are carried; the ones without say why.
   sample count decides. Ported from the upstream tests: `rtt_min_large` (RL-02) and
   `endpoint_reset_clears_stats` (RL-03), both red against the previous code.
 
-- **A zero `fragment_reassembly_buffer_size` is refused at create** (C 1.4.2). The C
-  config check covers all five buffer sizes; the port asserted four of them.
+- **A zero `fragment_reassembly_buffer_size` is refused at create, by name** (C 1.4.2).
+  It was refused before, but opaquely: the panic came from an assert inside the sequence
+  buffer's constructor, two calls down, naming `num_entries`. `Endpoint::new` now refuses
+  it beside the other config checks, and the test names the check rather than accepting
+  any panic.
+
+- **Two create-time refusals on `packet_header_size`** (C 1.4.3, `6055a51`,
+  `reliable.c:638` and `reliable.c:644`). C refuses a negative `packet_header_size`, and
+  a `packet_header_size` plus `max_packet_size` that does not fit its `int` packet
+  length. The port cannot receive a negative value — the field is a `usize` — and a
+  caller who casts a negative `int` into it lands on a huge value, which the second
+  check refuses. That second check is carried with `u32` as the bound rather than
+  `INT_MAX`, because a `u32` is what the port stores the length in: `send_packet` and
+  `receive_packet` record `packet_header_size + packet_bytes` in the `u32` the bandwidth
+  statistics are computed from, and both sites used to cast with `as u32`, which
+  truncates in silence. They are `u32::try_from(..)` now, and the create-time checks are
+  what make the conversion unable to fail — the send path is bounded by
+  `packet_header_size + max_packet_size`, the receive path by that sum plus the packet
+  and fragment headers its length gate allows, and each bound is refused at create if it
+  does not fit.
 
 ### Not applicable to the Rust port
 
@@ -71,11 +99,15 @@ Rust analogue are carried; the ones without say why.
   matches upstream at 1.4.5, and the port's ack-bit generation was never the behaviour
   the wording had described loosely.
 
-- **64-bit fragment arithmetic and eight bytes of tail slack on the reassembly buffer**
-  (C 1.4.3) — the C fix widened `int` arithmetic that sized a packet, and padded the
+- **64-bit fragment arithmetic, 64-bit bandwidth totals, and eight bytes of tail slack
+  on the reassembly buffer** (C 1.4.3) — the C fix widened `int` arithmetic that sized a
+  packet, widened the byte totals the bandwidth statistics accumulate, and padded the
   reassembly buffer so a reader loading an eight-byte window stays inside it. The port
-  computes these lengths in `usize` and copies through bounds-checked slices; it has no
+  computes packet lengths in `usize` and copies through bounds-checked slices; it has no
   eight-byte window read to protect, and a length mistake is a panic, not an over-read.
+  Its bandwidth totals already accumulate in `u64` (`bytes_sent` in
+  `smoothed_bandwidth_kbps`), which is what C widened to. The part of that release the
+  port did need — the `packet_header_size` refusals — is carried above.
 
 - **Fragment reassembly survives an allocator that returns NULL** (C 1.4.4) — the C
   receive path guarded its reassembly allocation with an assert alone and dereferenced

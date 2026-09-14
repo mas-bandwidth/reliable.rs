@@ -4,6 +4,10 @@ use crate::packet::{read_fragment_header, read_packet_header, write_packet_heade
 use crate::sequence_buffer::SequenceBuffer;
 use crate::{FRAGMENT_HEADER_BYTES, MAX_PACKET_HEADER_BYTES};
 
+/// What a received packet may carry on top of `max_packet_size`: the largest packet
+/// header, plus a fragment header. The receive length gate allows exactly this much.
+const MAX_RECEIVED_PACKET_OVERHEAD: usize = MAX_PACKET_HEADER_BYTES + FRAGMENT_HEADER_BYTES;
+
 /// Configuration for an [`Endpoint`].
 ///
 /// [`Config::default`] returns sensible defaults for a client/server game exchanging
@@ -256,7 +260,9 @@ impl Endpoint {
     /// # Panics
     ///
     /// Panics if the config is invalid: zero sizes, `max_fragments > 256`,
-    /// `fragment_above > max_packet_size`, or insufficient fragment capacity.
+    /// `fragment_above > max_packet_size`, insufficient fragment capacity, or a
+    /// `packet_header_size` that makes a packet length overflow the `u32` the
+    /// bandwidth counters carry.
     pub fn new(config: Config, time: f64) -> Self {
         assert!(config.max_packet_size > 0);
         assert!(config.fragment_above > 0);
@@ -272,6 +278,30 @@ impl Endpoint {
         assert!(config.received_packets_buffer_size > 0);
         assert!(config.fragment_reassembly_buffer_size > 0);
         assert!(config.rtt_history_size > 0);
+
+        // C 1.4.3 (6055a51), reliable.c:644:
+        //     if ( (int64_t) config->packet_header_size + (int64_t) config->max_packet_size > INT_MAX )
+        // C's bound is INT_MAX because its lengths are int. The port stores this sum as
+        // the u32 the bandwidth counters carry, so u32 is the length it has to fit.
+        // reliable.c:638, `packet_header_size < 0`, needs no check here: the field is a
+        // usize and cannot be negative. A caller who casts a negative int into it lands
+        // on a huge value, which this check refuses.
+        let sent_packet_length = config
+            .packet_header_size
+            .checked_add(config.max_packet_size);
+        assert!(
+            sent_packet_length.is_some_and(|bytes| u32::try_from(bytes).is_ok()),
+            "packet_header_size + max_packet_size must fit a u32 packet length"
+        );
+
+        // the receive path stores the same sum for a packet that arrives carrying both
+        // headers, and that is the largest length either path can reach
+        let received_packet_length =
+            sent_packet_length.and_then(|bytes| bytes.checked_add(MAX_RECEIVED_PACKET_OVERHEAD));
+        assert!(
+            received_packet_length.is_some_and(|bytes| u32::try_from(bytes).is_ok()),
+            "packet_header_size plus the largest receivable packet must fit a u32 packet length"
+        );
 
         let transmit_buffer_size = (config.max_packet_size + MAX_PACKET_HEADER_BYTES)
             .max(FRAGMENT_HEADER_BYTES + MAX_PACKET_HEADER_BYTES + config.fragment_size);
@@ -342,7 +372,10 @@ impl Endpoint {
         debug!("[{}] sending packet {}", self.config.name, sequence);
 
         let time = self.time;
-        let sent_packet_bytes = (self.config.packet_header_size + packet_bytes) as u32;
+        // packet_bytes is at most max_packet_size (checked above), and
+        // packet_header_size + max_packet_size is checked to fit a u32 at endpoint create
+        let sent_packet_bytes = u32::try_from(self.config.packet_header_size + packet_bytes)
+            .expect("sent packet length fits a u32, refused at endpoint create otherwise");
         let sent_packet_data = self
             .sent_packets
             .insert(sequence)
@@ -447,9 +480,7 @@ impl Endpoint {
 
         let packet_bytes = packet_data.len();
 
-        if packet_bytes
-            > self.config.max_packet_size + MAX_PACKET_HEADER_BYTES + FRAGMENT_HEADER_BYTES
-        {
+        if packet_bytes > self.config.max_packet_size + MAX_RECEIVED_PACKET_OVERHEAD {
             debug!(
                 "[{}] packet too large to receive. packet is at least {} bytes, maximum is {}",
                 self.config.name,
@@ -519,7 +550,13 @@ impl Endpoint {
                 );
 
                 let time = self.time;
-                let received_packet_bytes = (self.config.packet_header_size + packet_bytes) as u32;
+                // packet_bytes is at most max_packet_size + MAX_RECEIVED_PACKET_OVERHEAD
+                // (the receive gate above), and that sum plus packet_header_size is
+                // checked to fit a u32 at endpoint create
+                let received_packet_bytes = u32::try_from(
+                    self.config.packet_header_size + packet_bytes,
+                )
+                .expect("received packet length fits a u32, refused at endpoint create otherwise");
                 let received_packet_data = self
                     .received_packets
                     .insert(header.sequence)
@@ -1000,6 +1037,46 @@ mod tests {
             Config {
                 fragment_reassembly_buffer_size: 0,
                 ..test_config("invalid-reassembly-buffer")
+            },
+            0.0,
+        );
+    }
+
+    // C 1.4.3 (6055a51), reliable.c:644:
+    //     if ( (int64_t) config->packet_header_size + (int64_t) config->max_packet_size > INT_MAX )
+    // the port stores that sum in the u32 the bandwidth counters carry, so u32 is the
+    // length it has to fit
+
+    #[test]
+    #[should_panic(expected = "packet_header_size + max_packet_size must fit a u32 packet length")]
+    fn endpoint_rejects_packet_header_size_plus_max_packet_size_above_u32() {
+        Endpoint::new(
+            Config {
+                packet_header_size: 1,
+                max_packet_size: u32::MAX as usize,
+                max_fragments: 256,
+                fragment_size: 16 * 1024 * 1024,
+                ..test_config("overflowing-header-size")
+            },
+            0.0,
+        );
+    }
+
+    // the receive path stores the same sum for a packet that arrives carrying both
+    // headers, so the port refuses what C's condition alone would still let through
+
+    #[test]
+    #[should_panic(
+        expected = "packet_header_size plus the largest receivable packet must fit a u32 packet length"
+    )]
+    fn endpoint_rejects_packet_header_size_plus_largest_received_packet_above_u32() {
+        Endpoint::new(
+            Config {
+                packet_header_size: 10,
+                max_packet_size: u32::MAX as usize - 20,
+                max_fragments: 256,
+                fragment_size: 16 * 1024 * 1024,
+                ..test_config("overflowing-received-length")
             },
             0.0,
         );

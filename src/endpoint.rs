@@ -985,8 +985,12 @@ mod tests {
         );
     }
 
+    // the expected message matters: without it this test passes on the assert inside
+    // SequenceBuffer::new, whichever check fires first, and stays green if the
+    // create-time check is removed
+
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "config.fragment_reassembly_buffer_size > 0")]
     fn endpoint_rejects_zero_fragment_reassembly_buffer() {
         Endpoint::new(
             Config {

@@ -261,8 +261,8 @@ impl Endpoint {
     ///
     /// Panics if the config is invalid: zero sizes, `max_fragments > 256`,
     /// `fragment_above > max_packet_size`, insufficient fragment capacity, or a
-    /// `packet_header_size` that makes a packet length overflow the `u32` the
-    /// bandwidth counters carry.
+    /// fragment capacity or `packet_header_size` that makes a packet length overflow
+    /// the `u32` the port carries lengths in.
     pub fn new(config: Config, time: f64) -> Self {
         assert!(config.max_packet_size > 0);
         assert!(config.fragment_above > 0);
@@ -273,6 +273,20 @@ impl Endpoint {
         // max_fragments * fragment_size must cover max_packet_size. Compare using
         // division because the product could overflow usize.
         assert!(config.max_fragments > (config.max_packet_size - 1) / config.fragment_size);
+
+        // C 1.4.3 (259f4c8), reliable.c:624:
+        //     if ( (int64_t) config->max_fragments * config->fragment_size > (int64_t) INT_MAX - RELIABLE_MAX_PACKET_HEADER_BYTES )
+        // the port allocates exactly this length as the reassembly buffer, and a
+        // received fragment count is refused above max_fragments before it gets there,
+        // so bounding it here bounds the buffer
+        assert!(
+            config
+                .max_fragments
+                .checked_mul(config.fragment_size)
+                .and_then(|bytes| bytes.checked_add(MAX_PACKET_HEADER_BYTES))
+                .is_some_and(|bytes| u32::try_from(bytes).is_ok()),
+            "max_fragments * fragment_size must fit a u32 packet length"
+        );
         assert!(config.ack_buffer_size > 0);
         assert!(config.sent_packets_buffer_size > 0);
         assert!(config.received_packets_buffer_size > 0);
@@ -1042,6 +1056,23 @@ mod tests {
         );
     }
 
+    // C 1.4.3 (259f4c8), reliable.c:624:
+    //     if ( (int64_t) config->max_fragments * config->fragment_size > (int64_t) INT_MAX - RELIABLE_MAX_PACKET_HEADER_BYTES )
+    // the port allocates exactly that length as the reassembly buffer
+
+    #[test]
+    #[should_panic(expected = "max_fragments * fragment_size must fit a u32 packet length")]
+    fn endpoint_rejects_fragment_capacity_above_a_packet_length() {
+        Endpoint::new(
+            Config {
+                max_fragments: 256,
+                fragment_size: 16 * 1024 * 1024,
+                ..test_config("overflowing-fragment-capacity")
+            },
+            0.0,
+        );
+    }
+
     // C 1.4.3 (6055a51), reliable.c:644:
     //     if ( (int64_t) config->packet_header_size + (int64_t) config->max_packet_size > INT_MAX )
     // the port stores that sum in the u32 the bandwidth counters carry, so u32 is the
@@ -1052,10 +1083,12 @@ mod tests {
     fn endpoint_rejects_packet_header_size_plus_max_packet_size_above_u32() {
         Endpoint::new(
             Config {
-                packet_header_size: 1,
-                max_packet_size: u32::MAX as usize,
+                // the largest packet this fragment geometry carries, and the geometry
+                // itself fits a u32 packet length, so only the sum below does not
+                packet_header_size: 256,
+                max_packet_size: 256 * (16 * 1024 * 1024 - 1),
                 max_fragments: 256,
-                fragment_size: 16 * 1024 * 1024,
+                fragment_size: 16 * 1024 * 1024 - 1,
                 ..test_config("overflowing-header-size")
             },
             0.0,
@@ -1072,10 +1105,12 @@ mod tests {
     fn endpoint_rejects_packet_header_size_plus_largest_received_packet_above_u32() {
         Endpoint::new(
             Config {
-                packet_header_size: 10,
-                max_packet_size: u32::MAX as usize - 20,
+                // packet_header_size + max_packet_size fits a u32 and passes the check
+                // above; the packet and fragment headers a received packet may add do not
+                packet_header_size: 250,
+                max_packet_size: 256 * (16 * 1024 * 1024 - 1),
                 max_fragments: 256,
-                fragment_size: 16 * 1024 * 1024,
+                fragment_size: 16 * 1024 * 1024 - 1,
                 ..test_config("overflowing-received-length")
             },
             0.0,

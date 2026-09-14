@@ -51,6 +51,15 @@ drifts from upstream.
   it beside the other config checks, and the test names the check rather than accepting
   any panic.
 
+- **A fragment capacity that does not fit a packet length is refused at create**
+  (C 1.4.3, `259f4c8`, `reliable.c:624`). `max_fragments` times `fragment_size` is the
+  reassembly buffer's length, plus the packet header. C refuses a product that does not
+  fit its `int`; the port refuses one that does not fit a `u32`, and computes it with
+  `checked_mul` so the check cannot be defeated by the overflow it is checking for. A
+  received fragment count above `max_fragments` is already refused when the fragment
+  header is read, so bounding the configured product bounds the buffer the receive path
+  allocates.
+
 - **Two create-time refusals on `packet_header_size`** (C 1.4.3, `6055a51`,
   `reliable.c:638` and `reliable.c:644`). C refuses a negative `packet_header_size`, and
   a `packet_header_size` plus `max_packet_size` that does not fit its `int` packet
@@ -65,6 +74,18 @@ drifts from upstream.
   `packet_header_size + max_packet_size`, the receive path by that sum plus the packet
   and fragment headers its length gate allows, and each bound is refused at create if it
   does not fit.
+
+  A `u32` bound accepts configurations C refuses: a `packet_header_size` plus
+  `max_packet_size` anywhere in `[2^31, 2^32 - 15]`, and a fragment product up to
+  `2^32 - 10`, are refused by C's `INT_MAX` and accepted here. That is deliberate.
+  C's bound is the width of its own `int` packet lengths, not a property of the
+  protocol; the port's lengths are `usize` for every slice it indexes and `u32` only
+  where it stores a byte count for the bandwidth statistics, so those configurations are
+  representable everywhere the port uses them and nothing truncates. Nothing on the wire
+  depends on it either: a packet that large is refused by the send and receive gates of
+  both implementations long before the configuration matters, and the two libraries have
+  never been required to accept an identical set of configurations — only to agree,
+  byte for byte, on the packets they do exchange.
 
 ### Not applicable to the Rust port
 
@@ -87,8 +108,8 @@ drifts from upstream.
   and `Endpoint::new` panics on it rather than returning a `Result`.
 
 - **`reliable_endpoint_get_acks` returns a const view** (C 1.4.2) — `Endpoint::acks`
-  already returns `&[u16]` (`src/endpoint.rs:689`), a shared borrow the compiler will
-  not let the caller write through or hold across a mutation.
+  already returns `&[u16]`, a shared borrow the compiler will not let the caller write
+  through or hold across a mutation.
 
 - **The lifetime of every pointer a callback receives is stated in the header**
   (C 1.4.2) — the port hands callbacks `&[u8]` slices whose lifetimes the borrow
@@ -119,14 +140,14 @@ drifts from upstream.
 
 - **A reassembled packet never carries stale heap bytes** (C 1.4.5) — the port's
   reassembly buffer is already zero-initialised at allocation:
-  `reassembly_data.packet_data = vec![0; packet_buffer_size];`
-  (`src/endpoint.rs:614`). A hole left by a future logic error would deliver zeros
-  here too, never the contents of freed memory.
+  `reassembly_data.packet_data = vec![0; packet_buffer_size];`, in the fragment branch
+  of `Endpoint::receive_packet`, where C calls the allocator. A hole left by a future
+  logic error would deliver zeros here too, never the contents of freed memory.
 
 - **A caller's unterminated endpoint name cannot be over-read** (C 1.4.5) — the C fix
   forces a NUL onto the endpoint's copy of `reliable_config_t.name` and bounds the
-  twelve create-time rejection logs with `%.*s`. `Config::name` is a `String`
-  (`src/endpoint.rs:14`): Rust strings are length-delimited, carry no terminator, and
+  twelve create-time rejection logs with `%.*s`. `Config::name` is a `String`:
+  Rust strings are length-delimited, carry no terminator, and
   every log that prints the name prints exactly its bytes. There is nothing to run off
   the end of.
 

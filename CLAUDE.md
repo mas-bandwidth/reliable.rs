@@ -12,8 +12,8 @@ mint a new one — it is the wrong machine account. Either Glenn publishes from 
 account, or he moves the token into the mas keychain with the prompting form
 (`security add-generic-password -U -a rowan -s crates-io-token -w`, no value after -w).
 
-STATE as verified 2026-07-26: crates.io has `reliable` 1.3.4 (published 2026-07-12) while
-Cargo.toml here is at 1.4.0. So this is a publish-UPDATE and the crate name is already
+STATE as verified 2026-09-13: crates.io has `reliable` 1.3.4 (published 2026-07-12) while
+Cargo.toml here is at 1.4.5. So this is a publish-UPDATE and the crate name is already
 ours — no name trap. `cargo publish --dry-run` packages and compiles clean.
 <!-- HOT:END -->
 
@@ -43,8 +43,8 @@ in the library; the only unsafe in the repo is FFI in the `wire-compat` test cra
 
 ## Invariants — do not break these
 
-1. **Wire compatibility with C reliable 1.3.4 is the defining property.** `wire-compat/`
-   vendors the C reference (pinned at 1.3.4, commit `e00e11f`) and CI cross-feeds
+1. **Wire compatibility with C reliable 1.4.5 is the defining property.** `wire-compat/`
+   vendors the C reference (pinned at 1.4.5, commit `e4e7092`) and CI cross-feeds
    traffic both directions and requires byte-identical transcripts, on every push and
    PR, on Linux/macOS/Windows. Branch protection on `main` requires these checks (plus
    the rest of CI) for PR merges; force pushes are blocked. Any wire-format change is a
@@ -94,7 +94,12 @@ account. Deliberately not yet set up (offered 2026-07-12, deferred): crates.io t
 publishing via GitHub OIDC, a second crate owner, and a cross-link from the C repo's
 README to this port.
 
-## Status (2026-07-12)
+## Status (2026-09-13)
+
+1.4.5 prepared: the vendored C reference is at 1.4.5, the port carries every upstream
+change from 1.4.1 through 1.4.5 that has a Rust analogue (see CHANGELOG.md for the
+per-version disposition), and the crate version follows. crates.io still has 1.3.4 —
+publishing is Glenn's hand, from his own machine account.
 
 v1.3.4 released: repo public, crate on crates.io, docs.rs built, CI fully green,
-branch protection active, topics set. No open issues.
+branch protection active, topics set.

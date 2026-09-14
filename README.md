@@ -141,7 +141,7 @@ cargo run --example fuzz -- 100000 12345
 
 # Wire compatibility
 
-Wire compatibility with the C library is a locked-in invariant, not a one-time claim. The [wire-compat](wire-compat) test crate vendors the C reference implementation (pinned at 1.3.4) and links it directly into the test binary via FFI. On every push and pull request, on Linux, macOS and Windows, CI verifies that:
+Wire compatibility with the C library is a locked-in invariant, not a one-time claim. The [wire-compat](wire-compat) test crate vendors the C reference implementation (pinned at 1.4.5) and links it directly into the test binary via FFI. On every push and pull request, on Linux, macOS and Windows, CI verifies that:
 
 1. A Rust endpoint and a C endpoint exchanging bidirectional traffic (regular and fragmented) deliver every payload intact and ack everything the other sent.
 2. A Rust endpoint pair and a C endpoint pair driven through the same deterministic exchange put **byte-identical** datagrams on the wire.

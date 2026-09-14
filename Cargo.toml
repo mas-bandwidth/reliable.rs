@@ -1,6 +1,6 @@
 [package]
 name = "reliable"
-version = "1.4.0"
+version = "1.4.5"
 edition = "2024"
 rust-version = "1.88"
 authors = ["Glenn Fiedler <glenn@mas-bandwidth.com>"]

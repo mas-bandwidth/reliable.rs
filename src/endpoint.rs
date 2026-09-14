@@ -4,6 +4,10 @@ use crate::packet::{read_fragment_header, read_packet_header, write_packet_heade
 use crate::sequence_buffer::SequenceBuffer;
 use crate::{FRAGMENT_HEADER_BYTES, MAX_PACKET_HEADER_BYTES};
 
+/// What a received packet may carry on top of `max_packet_size`: the largest packet
+/// header, plus a fragment header. The receive length gate allows exactly this much.
+const MAX_RECEIVED_PACKET_OVERHEAD: usize = MAX_PACKET_HEADER_BYTES + FRAGMENT_HEADER_BYTES;
+
 /// Configuration for an [`Endpoint`].
 ///
 /// [`Config::default`] returns sensible defaults for a client/server game exchanging
@@ -256,7 +260,9 @@ impl Endpoint {
     /// # Panics
     ///
     /// Panics if the config is invalid: zero sizes, `max_fragments > 256`,
-    /// `fragment_above > max_packet_size`, or insufficient fragment capacity.
+    /// `fragment_above > max_packet_size`, insufficient fragment capacity, or a
+    /// fragment capacity or `packet_header_size` that makes a packet length overflow
+    /// the `u32` the port carries lengths in.
     pub fn new(config: Config, time: f64) -> Self {
         assert!(config.max_packet_size > 0);
         assert!(config.fragment_above > 0);
@@ -267,10 +273,49 @@ impl Endpoint {
         // max_fragments * fragment_size must cover max_packet_size. Compare using
         // division because the product could overflow usize.
         assert!(config.max_fragments > (config.max_packet_size - 1) / config.fragment_size);
+
+        // C 1.4.3 (259f4c8), reliable.c:624:
+        //     if ( (int64_t) config->max_fragments * config->fragment_size > (int64_t) INT_MAX - RELIABLE_MAX_PACKET_HEADER_BYTES )
+        // the port allocates exactly this length as the reassembly buffer, and a
+        // received fragment count is refused above max_fragments before it gets there,
+        // so bounding it here bounds the buffer
+        assert!(
+            config
+                .max_fragments
+                .checked_mul(config.fragment_size)
+                .and_then(|bytes| bytes.checked_add(MAX_PACKET_HEADER_BYTES))
+                .is_some_and(|bytes| u32::try_from(bytes).is_ok()),
+            "max_fragments * fragment_size must fit a u32 packet length"
+        );
         assert!(config.ack_buffer_size > 0);
         assert!(config.sent_packets_buffer_size > 0);
         assert!(config.received_packets_buffer_size > 0);
+        assert!(config.fragment_reassembly_buffer_size > 0);
         assert!(config.rtt_history_size > 0);
+
+        // C 1.4.3 (6055a51), reliable.c:644:
+        //     if ( (int64_t) config->packet_header_size + (int64_t) config->max_packet_size > INT_MAX )
+        // C's bound is INT_MAX because its lengths are int. The port stores this sum as
+        // the u32 the bandwidth counters carry, so u32 is the length it has to fit.
+        // reliable.c:638, `packet_header_size < 0`, needs no check here: the field is a
+        // usize and cannot be negative. A caller who casts a negative int into it lands
+        // on a huge value, which this check refuses.
+        let sent_packet_length = config
+            .packet_header_size
+            .checked_add(config.max_packet_size);
+        assert!(
+            sent_packet_length.is_some_and(|bytes| u32::try_from(bytes).is_ok()),
+            "packet_header_size + max_packet_size must fit a u32 packet length"
+        );
+
+        // the receive path stores the same sum for a packet that arrives carrying both
+        // headers, and that is the largest length either path can reach
+        let received_packet_length =
+            sent_packet_length.and_then(|bytes| bytes.checked_add(MAX_RECEIVED_PACKET_OVERHEAD));
+        assert!(
+            received_packet_length.is_some_and(|bytes| u32::try_from(bytes).is_ok()),
+            "packet_header_size plus the largest receivable packet must fit a u32 packet length"
+        );
 
         let transmit_buffer_size = (config.max_packet_size + MAX_PACKET_HEADER_BYTES)
             .max(FRAGMENT_HEADER_BYTES + MAX_PACKET_HEADER_BYTES + config.fragment_size);
@@ -341,7 +386,10 @@ impl Endpoint {
         debug!("[{}] sending packet {}", self.config.name, sequence);
 
         let time = self.time;
-        let sent_packet_bytes = (self.config.packet_header_size + packet_bytes) as u32;
+        // packet_bytes is at most max_packet_size (checked above), and
+        // packet_header_size + max_packet_size is checked to fit a u32 at endpoint create
+        let sent_packet_bytes = u32::try_from(self.config.packet_header_size + packet_bytes)
+            .expect("sent packet length fits a u32, refused at endpoint create otherwise");
         let sent_packet_data = self
             .sent_packets
             .insert(sequence)
@@ -446,9 +494,7 @@ impl Endpoint {
 
         let packet_bytes = packet_data.len();
 
-        if packet_bytes
-            > self.config.max_packet_size + MAX_PACKET_HEADER_BYTES + FRAGMENT_HEADER_BYTES
-        {
+        if packet_bytes > self.config.max_packet_size + MAX_RECEIVED_PACKET_OVERHEAD {
             debug!(
                 "[{}] packet too large to receive. packet is at least {} bytes, maximum is {}",
                 self.config.name,
@@ -518,7 +564,13 @@ impl Endpoint {
                 );
 
                 let time = self.time;
-                let received_packet_bytes = (self.config.packet_header_size + packet_bytes) as u32;
+                // packet_bytes is at most max_packet_size + MAX_RECEIVED_PACKET_OVERHEAD
+                // (the receive gate above), and that sum plus packet_header_size is
+                // checked to fit a u32 at endpoint create
+                let received_packet_bytes = u32::try_from(
+                    self.config.packet_header_size + packet_bytes,
+                )
+                .expect("received packet length fits a u32, refused at endpoint create otherwise");
                 let received_packet_data = self
                     .received_packets
                     .insert(header.sequence)
@@ -712,12 +764,32 @@ impl Endpoint {
         self.acks.drain(..)
     }
 
-    /// Resets the endpoint to its initial state: acks, counters, sequence number and all
-    /// tracking buffers are cleared.
+    /// Resets the endpoint to its initial state: acks, counters, sequence number, all
+    /// tracking buffers, the rtt history and every rtt, jitter, packet loss and
+    /// bandwidth statistic are cleared. The config is kept, so the endpoint is
+    /// immediately usable again.
     pub fn reset(&mut self) {
         self.acks.clear();
         self.sequence = 0;
         self.counters = Counters::default();
+
+        // every value a getter can return goes back to what it was at create, so the
+        // documented promise holds for the statistics as well as for the buffers
+
+        self.rtt = 0.0;
+        self.rtt_min = 0.0;
+        self.rtt_max = 0.0;
+        self.rtt_avg = 0.0;
+        self.jitter_avg_vs_min_rtt = 0.0;
+        self.jitter_max_vs_min_rtt = 0.0;
+        self.jitter_stddev_vs_avg_rtt = 0.0;
+        self.packet_loss = 0.0;
+        self.sent_bandwidth_kbps = 0.0;
+        self.received_bandwidth_kbps = 0.0;
+        self.acked_bandwidth_kbps = 0.0;
+
+        self.rtt_history_buffer.fill(-1.0);
+
         self.sent_packets.reset();
         self.received_packets.reset();
         self.fragment_reassembly.reset();
@@ -730,7 +802,7 @@ impl Endpoint {
 
         // calculate min, max and average rtt
         {
-            let mut min_rtt = 10000.0_f32;
+            let mut min_rtt = f32::MAX;
             let mut max_rtt = 0.0_f32;
             let mut sum_rtt = 0.0_f32;
             let mut count = 0;
@@ -746,16 +818,19 @@ impl Endpoint {
                     count += 1;
                 }
             }
-            if min_rtt == 10000.0 {
-                min_rtt = 0.0;
-            }
-            self.rtt_min = min_rtt;
-            self.rtt_max = max_rtt;
-            self.rtt_avg = if count > 0 {
-                sum_rtt / count as f32
+            // the sample count, not the value of min_rtt, says whether the history is
+            // empty. a sentinel compared against a real rtt reports 0 for a link slow
+            // enough to reach it
+
+            if count > 0 {
+                self.rtt_min = min_rtt;
+                self.rtt_max = max_rtt;
+                self.rtt_avg = sum_rtt / count as f32;
             } else {
-                0.0
-            };
+                self.rtt_min = 0.0;
+                self.rtt_max = 0.0;
+                self.rtt_avg = 0.0;
+            }
         }
 
         // calculate average and max jitter vs. min rtt
@@ -933,8 +1008,11 @@ mod tests {
         }
     }
 
+    // each of these three pins its expected message to the create-time check it names:
+    // a bare should_panic accepts any panic, including one from a layer below
+
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "config.fragment_above <= config.max_packet_size")]
     fn endpoint_rejects_fragment_threshold_above_max_packet() {
         Endpoint::new(
             Config {
@@ -947,7 +1025,9 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
+    #[should_panic(
+        expected = "config.max_fragments > (config.max_packet_size - 1) / config.fragment_size"
+    )]
     fn endpoint_rejects_fragment_capacity_below_max_packet() {
         Endpoint::new(
             Config {
@@ -956,6 +1036,82 @@ mod tests {
                 max_fragments: 4,
                 fragment_size: 250,
                 ..test_config("invalid-capacity")
+            },
+            0.0,
+        );
+    }
+
+    // this one was passing on the assert inside SequenceBuffer::new, and stayed green
+    // with the create-time check removed
+
+    #[test]
+    #[should_panic(expected = "config.fragment_reassembly_buffer_size > 0")]
+    fn endpoint_rejects_zero_fragment_reassembly_buffer() {
+        Endpoint::new(
+            Config {
+                fragment_reassembly_buffer_size: 0,
+                ..test_config("invalid-reassembly-buffer")
+            },
+            0.0,
+        );
+    }
+
+    // C 1.4.3 (259f4c8), reliable.c:624:
+    //     if ( (int64_t) config->max_fragments * config->fragment_size > (int64_t) INT_MAX - RELIABLE_MAX_PACKET_HEADER_BYTES )
+    // the port allocates exactly that length as the reassembly buffer
+
+    #[test]
+    #[should_panic(expected = "max_fragments * fragment_size must fit a u32 packet length")]
+    fn endpoint_rejects_fragment_capacity_above_a_packet_length() {
+        Endpoint::new(
+            Config {
+                max_fragments: 256,
+                fragment_size: 16 * 1024 * 1024,
+                ..test_config("overflowing-fragment-capacity")
+            },
+            0.0,
+        );
+    }
+
+    // C 1.4.3 (6055a51), reliable.c:644:
+    //     if ( (int64_t) config->packet_header_size + (int64_t) config->max_packet_size > INT_MAX )
+    // the port stores that sum in the u32 the bandwidth counters carry, so u32 is the
+    // length it has to fit
+
+    #[test]
+    #[should_panic(expected = "packet_header_size + max_packet_size must fit a u32 packet length")]
+    fn endpoint_rejects_packet_header_size_plus_max_packet_size_above_u32() {
+        Endpoint::new(
+            Config {
+                // the largest packet this fragment geometry carries, and the geometry
+                // itself fits a u32 packet length, so only the sum below does not
+                packet_header_size: 256,
+                max_packet_size: 256 * (16 * 1024 * 1024 - 1),
+                max_fragments: 256,
+                fragment_size: 16 * 1024 * 1024 - 1,
+                ..test_config("overflowing-header-size")
+            },
+            0.0,
+        );
+    }
+
+    // the receive path stores the same sum for a packet that arrives carrying both
+    // headers, so the port refuses what C's condition alone would still let through
+
+    #[test]
+    #[should_panic(
+        expected = "packet_header_size plus the largest receivable packet must fit a u32 packet length"
+    )]
+    fn endpoint_rejects_packet_header_size_plus_largest_received_packet_above_u32() {
+        Endpoint::new(
+            Config {
+                // packet_header_size + max_packet_size fits a u32 and passes the check
+                // above; the packet and fragment headers a received packet may add do not
+                packet_header_size: 250,
+                max_packet_size: 256 * (16 * 1024 * 1024 - 1),
+                max_fragments: 256,
+                fragment_size: 16 * 1024 * 1024 - 1,
+                ..test_config("overflowing-received-length")
             },
             0.0,
         );
@@ -1528,5 +1684,125 @@ mod tests {
 
         assert!(!sender.acks().is_empty());
         assert!(receiver.counters().num_packets_received > 0);
+    }
+
+    // RL-02: a round trip long enough to reach any fixed sentinel must still be reported
+
+    #[test]
+    fn rtt_min_large() {
+        let mut time = 100.0;
+
+        let mut sender = Endpoint::new(test_config("sender"), time);
+        let mut receiver = Endpoint::new(test_config("receiver"), time);
+
+        let packet = [0u8; 8];
+
+        sender.send_packet(&packet, |_, data| {
+            receiver.receive_packet(data, |_, _| true);
+        });
+
+        // ten seconds pass before the acknowledgment comes back, so the one rtt sample
+        // is 10,000 ms
+
+        time += 10.0;
+
+        sender.update(time);
+        receiver.update(time);
+
+        receiver.send_packet(&packet, |_, data| {
+            sender.receive_packet(data, |_, _| true);
+        });
+
+        sender.update(time);
+
+        assert_eq!(sender.acks().len(), 1);
+
+        assert_eq!(sender.rtt_min(), 10000.0);
+        assert_eq!(sender.rtt_max(), 10000.0);
+        assert_eq!(sender.rtt_avg(), 10000.0);
+        assert_eq!(sender.jitter_avg_vs_min_rtt(), 0.0);
+        assert_eq!(sender.jitter_max_vs_min_rtt(), 0.0);
+
+        // and an endpoint with no samples at all still reports zero
+
+        assert_eq!(receiver.rtt_min(), 0.0);
+    }
+
+    // RL-03: reset clears every field a getter can return, the rtt history included
+
+    #[test]
+    fn endpoint_reset_clears_stats() {
+        let mut time = 100.0;
+
+        let mut sender = Endpoint::new(test_config("sender"), time);
+        let mut receiver = Endpoint::new(test_config("receiver"), time);
+
+        // enough packets that the bandwidth window, which samples half the sent packets
+        // buffer, lands on packets that were actually sent
+
+        for _ in 0..300 {
+            let packet = [0u8; 64];
+
+            // the reply comes back a step later, so the acknowledgment carries a real
+            // round trip
+
+            sender.send_packet(&packet, |_, data| {
+                receiver.receive_packet(data, |_, _| true);
+            });
+
+            time += 0.1;
+            sender.update(time);
+            receiver.update(time);
+
+            receiver.send_packet(&packet, |_, data| {
+                sender.receive_packet(data, |_, _| true);
+            });
+
+            time += 0.1;
+            sender.update(time);
+            receiver.update(time);
+
+            sender.clear_acks();
+            receiver.clear_acks();
+        }
+
+        assert!(sender.rtt() > 0.0);
+        assert!(sender.rtt_min() > 0.0);
+        assert!(sender.rtt_max() > 0.0);
+        assert!(sender.rtt_avg() > 0.0);
+
+        let bandwidth = sender.bandwidth();
+        assert!(bandwidth.sent_kbps > 0.0);
+        assert!(bandwidth.received_kbps > 0.0);
+        assert!(bandwidth.acked_kbps > 0.0);
+
+        sender.reset();
+
+        assert_eq!(sender.rtt(), 0.0);
+        assert_eq!(sender.rtt_min(), 0.0);
+        assert_eq!(sender.rtt_max(), 0.0);
+        assert_eq!(sender.rtt_avg(), 0.0);
+        assert_eq!(sender.jitter_avg_vs_min_rtt(), 0.0);
+        assert_eq!(sender.jitter_max_vs_min_rtt(), 0.0);
+        assert_eq!(sender.jitter_stddev_vs_avg_rtt(), 0.0);
+        assert_eq!(sender.packet_loss(), 0.0);
+
+        let bandwidth = sender.bandwidth();
+        assert_eq!(bandwidth.sent_kbps, 0.0);
+        assert_eq!(bandwidth.received_kbps, 0.0);
+        assert_eq!(bandwidth.acked_kbps, 0.0);
+
+        // the rtt history is part of the state, so recomputing the statistics after a
+        // reset must not resurrect the samples that were in it
+
+        time += 0.1;
+        sender.update(time);
+
+        assert_eq!(sender.rtt_min(), 0.0);
+        assert_eq!(sender.rtt_max(), 0.0);
+        assert_eq!(sender.rtt_avg(), 0.0);
+        assert_eq!(sender.jitter_avg_vs_min_rtt(), 0.0);
+        assert_eq!(sender.jitter_max_vs_min_rtt(), 0.0);
+        assert_eq!(sender.jitter_stddev_vs_avg_rtt(), 0.0);
     }
 }

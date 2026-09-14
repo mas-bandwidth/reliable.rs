@@ -270,6 +270,7 @@ impl Endpoint {
         assert!(config.ack_buffer_size > 0);
         assert!(config.sent_packets_buffer_size > 0);
         assert!(config.received_packets_buffer_size > 0);
+        assert!(config.fragment_reassembly_buffer_size > 0);
         assert!(config.rtt_history_size > 0);
 
         let transmit_buffer_size = (config.max_packet_size + MAX_PACKET_HEADER_BYTES)
@@ -712,12 +713,32 @@ impl Endpoint {
         self.acks.drain(..)
     }
 
-    /// Resets the endpoint to its initial state: acks, counters, sequence number and all
-    /// tracking buffers are cleared.
+    /// Resets the endpoint to its initial state: acks, counters, sequence number, all
+    /// tracking buffers, the rtt history and every rtt, jitter, packet loss and
+    /// bandwidth statistic are cleared. The config is kept, so the endpoint is
+    /// immediately usable again.
     pub fn reset(&mut self) {
         self.acks.clear();
         self.sequence = 0;
         self.counters = Counters::default();
+
+        // every value a getter can return goes back to what it was at create, so the
+        // documented promise holds for the statistics as well as for the buffers
+
+        self.rtt = 0.0;
+        self.rtt_min = 0.0;
+        self.rtt_max = 0.0;
+        self.rtt_avg = 0.0;
+        self.jitter_avg_vs_min_rtt = 0.0;
+        self.jitter_max_vs_min_rtt = 0.0;
+        self.jitter_stddev_vs_avg_rtt = 0.0;
+        self.packet_loss = 0.0;
+        self.sent_bandwidth_kbps = 0.0;
+        self.received_bandwidth_kbps = 0.0;
+        self.acked_bandwidth_kbps = 0.0;
+
+        self.rtt_history_buffer.fill(-1.0);
+
         self.sent_packets.reset();
         self.received_packets.reset();
         self.fragment_reassembly.reset();
@@ -730,7 +751,7 @@ impl Endpoint {
 
         // calculate min, max and average rtt
         {
-            let mut min_rtt = 10000.0_f32;
+            let mut min_rtt = f32::MAX;
             let mut max_rtt = 0.0_f32;
             let mut sum_rtt = 0.0_f32;
             let mut count = 0;
@@ -746,16 +767,19 @@ impl Endpoint {
                     count += 1;
                 }
             }
-            if min_rtt == 10000.0 {
-                min_rtt = 0.0;
-            }
-            self.rtt_min = min_rtt;
-            self.rtt_max = max_rtt;
-            self.rtt_avg = if count > 0 {
-                sum_rtt / count as f32
+            // the sample count, not the value of min_rtt, says whether the history is
+            // empty. a sentinel compared against a real rtt reports 0 for a link slow
+            // enough to reach it
+
+            if count > 0 {
+                self.rtt_min = min_rtt;
+                self.rtt_max = max_rtt;
+                self.rtt_avg = sum_rtt / count as f32;
             } else {
-                0.0
-            };
+                self.rtt_min = 0.0;
+                self.rtt_max = 0.0;
+                self.rtt_avg = 0.0;
+            }
         }
 
         // calculate average and max jitter vs. min rtt
@@ -956,6 +980,18 @@ mod tests {
                 max_fragments: 4,
                 fragment_size: 250,
                 ..test_config("invalid-capacity")
+            },
+            0.0,
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    fn endpoint_rejects_zero_fragment_reassembly_buffer() {
+        Endpoint::new(
+            Config {
+                fragment_reassembly_buffer_size: 0,
+                ..test_config("invalid-reassembly-buffer")
             },
             0.0,
         );
@@ -1528,5 +1564,125 @@ mod tests {
 
         assert!(!sender.acks().is_empty());
         assert!(receiver.counters().num_packets_received > 0);
+    }
+
+    // RL-02: a round trip long enough to reach any fixed sentinel must still be reported
+
+    #[test]
+    fn rtt_min_large() {
+        let mut time = 100.0;
+
+        let mut sender = Endpoint::new(test_config("sender"), time);
+        let mut receiver = Endpoint::new(test_config("receiver"), time);
+
+        let packet = [0u8; 8];
+
+        sender.send_packet(&packet, |_, data| {
+            receiver.receive_packet(data, |_, _| true);
+        });
+
+        // ten seconds pass before the acknowledgment comes back, so the one rtt sample
+        // is 10,000 ms
+
+        time += 10.0;
+
+        sender.update(time);
+        receiver.update(time);
+
+        receiver.send_packet(&packet, |_, data| {
+            sender.receive_packet(data, |_, _| true);
+        });
+
+        sender.update(time);
+
+        assert_eq!(sender.acks().len(), 1);
+
+        assert_eq!(sender.rtt_min(), 10000.0);
+        assert_eq!(sender.rtt_max(), 10000.0);
+        assert_eq!(sender.rtt_avg(), 10000.0);
+        assert_eq!(sender.jitter_avg_vs_min_rtt(), 0.0);
+        assert_eq!(sender.jitter_max_vs_min_rtt(), 0.0);
+
+        // and an endpoint with no samples at all still reports zero
+
+        assert_eq!(receiver.rtt_min(), 0.0);
+    }
+
+    // RL-03: reset clears every field a getter can return, the rtt history included
+
+    #[test]
+    fn endpoint_reset_clears_stats() {
+        let mut time = 100.0;
+
+        let mut sender = Endpoint::new(test_config("sender"), time);
+        let mut receiver = Endpoint::new(test_config("receiver"), time);
+
+        // enough packets that the bandwidth window, which samples half the sent packets
+        // buffer, lands on packets that were actually sent
+
+        for _ in 0..300 {
+            let packet = [0u8; 64];
+
+            // the reply comes back a step later, so the acknowledgment carries a real
+            // round trip
+
+            sender.send_packet(&packet, |_, data| {
+                receiver.receive_packet(data, |_, _| true);
+            });
+
+            time += 0.1;
+            sender.update(time);
+            receiver.update(time);
+
+            receiver.send_packet(&packet, |_, data| {
+                sender.receive_packet(data, |_, _| true);
+            });
+
+            time += 0.1;
+            sender.update(time);
+            receiver.update(time);
+
+            sender.clear_acks();
+            receiver.clear_acks();
+        }
+
+        assert!(sender.rtt() > 0.0);
+        assert!(sender.rtt_min() > 0.0);
+        assert!(sender.rtt_max() > 0.0);
+        assert!(sender.rtt_avg() > 0.0);
+
+        let bandwidth = sender.bandwidth();
+        assert!(bandwidth.sent_kbps > 0.0);
+        assert!(bandwidth.received_kbps > 0.0);
+        assert!(bandwidth.acked_kbps > 0.0);
+
+        sender.reset();
+
+        assert_eq!(sender.rtt(), 0.0);
+        assert_eq!(sender.rtt_min(), 0.0);
+        assert_eq!(sender.rtt_max(), 0.0);
+        assert_eq!(sender.rtt_avg(), 0.0);
+        assert_eq!(sender.jitter_avg_vs_min_rtt(), 0.0);
+        assert_eq!(sender.jitter_max_vs_min_rtt(), 0.0);
+        assert_eq!(sender.jitter_stddev_vs_avg_rtt(), 0.0);
+        assert_eq!(sender.packet_loss(), 0.0);
+
+        let bandwidth = sender.bandwidth();
+        assert_eq!(bandwidth.sent_kbps, 0.0);
+        assert_eq!(bandwidth.received_kbps, 0.0);
+        assert_eq!(bandwidth.acked_kbps, 0.0);
+
+        // the rtt history is part of the state, so recomputing the statistics after a
+        // reset must not resurrect the samples that were in it
+
+        time += 0.1;
+        sender.update(time);
+
+        assert_eq!(sender.rtt_min(), 0.0);
+        assert_eq!(sender.rtt_max(), 0.0);
+        assert_eq!(sender.rtt_avg(), 0.0);
+        assert_eq!(sender.jitter_avg_vs_min_rtt(), 0.0);
+        assert_eq!(sender.jitter_max_vs_min_rtt(), 0.0);
+        assert_eq!(sender.jitter_stddev_vs_avg_rtt(), 0.0);
     }
 }

@@ -1,5 +1,5 @@
 //! Wire-compatibility tests: the Rust port exchanging packets with the vendored C
-//! reference implementation of reliable 1.3.4, in process, via FFI.
+//! reference implementation of reliable 1.4.5, in process, via FFI.
 //!
 //! Two invariants are locked in here, run by CI on every push and pull request:
 //!

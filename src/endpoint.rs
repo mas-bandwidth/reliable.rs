@@ -957,8 +957,11 @@ mod tests {
         }
     }
 
+    // each of these three pins its expected message to the create-time check it names:
+    // a bare should_panic accepts any panic, including one from a layer below
+
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "config.fragment_above <= config.max_packet_size")]
     fn endpoint_rejects_fragment_threshold_above_max_packet() {
         Endpoint::new(
             Config {
@@ -971,7 +974,9 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
+    #[should_panic(
+        expected = "config.max_fragments > (config.max_packet_size - 1) / config.fragment_size"
+    )]
     fn endpoint_rejects_fragment_capacity_below_max_packet() {
         Endpoint::new(
             Config {
@@ -985,9 +990,8 @@ mod tests {
         );
     }
 
-    // the expected message matters: without it this test passes on the assert inside
-    // SequenceBuffer::new, whichever check fires first, and stays green if the
-    // create-time check is removed
+    // this one was passing on the assert inside SequenceBuffer::new, and stayed green
+    // with the create-time check removed
 
     #[test]
     #[should_panic(expected = "config.fragment_reassembly_buffer_size > 0")]

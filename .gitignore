@@ -1,4 +1,5 @@
 /target
+/wire-compat/target
 /fuzz/target
 /fuzz/corpus
 /fuzz/artifacts

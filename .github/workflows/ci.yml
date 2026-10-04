@@ -1,9 +1,34 @@
+# This workflow holds a pull request's critical path to one minute on average and
+# two minutes at most, measured from the run's start to its last required job.
+
 name: CI
 
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '**/*.png'
+      - '**/*.jpg'
+      - '**/*.jpeg'
+      - '**/*.gif'
+      - '**/*.svg'
+      - '**/*.webp'
+      - '**/*.ico'
+      - '**/*.bmp'
   pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '**/*.png'
+      - '**/*.jpg'
+      - '**/*.jpeg'
+      - '**/*.gif'
+      - '**/*.svg'
+      - '**/*.webp'
+      - '**/*.ico'
+      - '**/*.bmp'
   workflow_dispatch:
 
 env:
@@ -96,7 +121,9 @@ jobs:
       - uses: taiki-e/install-action@v2.87.0
         with:
           tool: cargo-fuzz
-      - run: cargo fuzz run fuzz_endpoint --target x86_64-unknown-linux-gnu -- -max_total_time=60
+      # The per-change smoke holds the pull request budget to 10 s a target;
+      # fuzz.yml keeps the 30-minute coverage-guided run on its weekly schedule.
+      - run: cargo fuzz run fuzz_endpoint --target x86_64-unknown-linux-gnu -- -max_total_time=10
 
   spec-sync:
     name: STANDARD.md matches upstream

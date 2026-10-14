@@ -2,6 +2,11 @@
 
 Versions track the upstream C library.
 
+## Unreleased
+
+- An empty packet received from the socket is counted invalid and ignored instead of
+  panicking (C reliable PR 69, merge 190bce5b).
+
 ## 1.4.5 (2026-09-13)
 
 Tracks C reliable 1.4.5. The vendored reference in `wire-compat/c/` moves from 1.3.4 to

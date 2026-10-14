@@ -837,4 +837,83 @@ mod tests {
             }
         }
     }
+
+    /// Differential test against the C reference for the empty-packet fix. An empty
+    /// datagram is counted invalid and ignored by the C reference (C reliable PR 69,
+    /// merge 190bce5b) rather than aborting the receive; the port must match byte for
+    /// byte.
+    ///
+    /// The inputs are a zero-length packet, one-byte packets {0} and {1}, a packet of
+    /// exactly max_packet_size + 14 bytes of zeros, one byte more than that, and a valid
+    /// packet built by a sender — each fed in turn to the same receiver.
+    ///
+    /// Gated on `RELIABLE_C_DIR` (used only to refresh the vendored C): when it is unset
+    /// the test skips with a loud message so the unit gate stays hermetic. Run:
+    ///
+    ///     cargo test --manifest-path wire-compat/Cargo.toml differential_empty_packet_against_c_reference
+    #[test]
+    fn differential_empty_packet_against_c_reference() {
+        if std::env::var_os("RELIABLE_C_DIR").is_none() {
+            eprintln!(
+                "SKIP differential_empty_packet_against_c_reference: RELIABLE_C_DIR is unset; \
+                 no C checkout holding the empty-packet fix (PR 69, merge 190bce5b) is \
+                 reachable, so this leg is not-done. Refresh wire-compat/c from such a \
+                 checkout, then run `cargo test --manifest-path wire-compat/Cargo.toml \
+                 differential_empty_packet_against_c_reference`."
+            );
+            return;
+        }
+
+        const FRAGMENT_ABOVE: usize = 500;
+
+        let max_packet_size = Config::default().max_packet_size;
+
+        let mut inputs: Vec<Vec<u8>> = Vec::new();
+        inputs.push(Vec::new());                      // zero length
+        inputs.push(vec![0u8]);                       // {0}
+        inputs.push(vec![1u8]);                       // {1}
+        inputs.push(vec![0u8; max_packet_size + 14]); // exactly the receive limit
+        inputs.push(vec![0u8; max_packet_size + 15]); // one byte past it
+
+        let mut producer = Endpoint::new(
+            Config {
+                name: "producer".to_string(),
+                fragment_above: FRAGMENT_ABOVE,
+                ..Config::default()
+            },
+            100.0,
+        );
+        producer.send_packet(&[1, 2, 3], |_, data| inputs.push(data.to_vec()));
+
+        let diffs = unsafe { wire_compat_diff_create(FRAGMENT_ABOVE as c_int) };
+        assert!(!diffs.is_null(), "C differential endpoint create failed");
+
+        let mut c_lines: Vec<String> = Vec::new();
+        let mut rust_lines: Vec<String> = Vec::new();
+
+        let mut endpoint = Endpoint::new(
+            Config {
+                name: "rust".to_string(),
+                fragment_above: FRAGMENT_ABOVE,
+                ..Config::default()
+            },
+            100.0,
+        );
+        let mut previous = [0u64; 11];
+
+        for (n, input) in inputs.iter().enumerate() {
+            c_lines.push(c_diff_line(diffs, n, input));
+            rust_lines.push(rust_diff_line(n, &mut endpoint, &mut previous, input));
+        }
+
+        unsafe { wire_compat_diff_destroy(diffs) };
+
+        for (n, (c_line, rust_line)) in c_lines.iter().zip(rust_lines.iter()).enumerate() {
+            if c_line != rust_line {
+                panic!(
+                    "transcript differs at input {n}:\n  C   : {c_line}\n  rust: {rust_line}"
+                );
+            }
+        }
+    }
 }

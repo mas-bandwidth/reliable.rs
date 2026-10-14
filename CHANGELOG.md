@@ -25,6 +25,13 @@ drifts from upstream.
 
 ### Carried into the port
 
+- **A fragment does not advance the received window** (C PR #68, merge `dfd5541c`). A
+  fragment whose sequence is outside the received window is refused and counted
+  `num_fragments_invalid` before any reassembly entry exists, and a fragment no longer
+  advances the window when its reassembly entry is created: the reassembled packet
+  advances it through the regular receive path when accepted. A single unfinished
+  fragment used to make genuine in-flight packets stale.
+
 - **A configuration that cannot fit a packet is refused at endpoint create** (C 1.4.3;
   reliable.rs#20, PR #22, reported as security#41). `Endpoint::new` rejects
   `fragment_above > max_packet_size`, and a fragment capacity too small to carry a

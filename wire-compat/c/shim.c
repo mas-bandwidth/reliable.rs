@@ -148,3 +148,79 @@ int wire_compat_diff_feed( void * handle, const uint8_t * data, int len, int n, 
 
     return written;
 }
+
+// ---------------------------------------------------------------
+// fragment oracle
+//
+// one crafted-input line per call, on a fresh endpoint:
+//   <case> <fragment seq> <refused|accepted> <genuine seq 0 delivered 0|1> <eleven counters>
+// feeds an optional advance packet, then one or two fragment datagrams, then a genuine
+// sequence 0 packet. a fragment is "refused" when it bumped NUM_FRAGMENTS_INVALID, else
+// "accepted". delivered is whether any process callback ran across the fragments and the
+// genuine packet, so a completed reassembly counts. fragment_sequence is reported as given.
+
+int wire_compat_frag_oracle( const char * case_name,
+                             int fragment_above,
+                             int fragment_sequence,
+                             const uint8_t * advance, int advance_len,
+                             const uint8_t * fragment1, int fragment1_len,
+                             const uint8_t * fragment2, int fragment2_len,
+                             const uint8_t * genuine, int genuine_len,
+                             char * out, int cap )
+{
+    struct wire_compat_diff_t * diff = (struct wire_compat_diff_t*) calloc( 1, sizeof( struct wire_compat_diff_t ) );
+    if ( !diff )
+        return -1;
+    diff->endpoint = wire_compat_endpoint_create( fragment_above, 0, diff, wire_compat_diff_transmit, wire_compat_diff_process );
+    if ( !diff->endpoint )
+    {
+        free( diff );
+        return -1;
+    }
+
+    if ( advance_len > 0 )
+        reliable_endpoint_receive_packet( diff->endpoint, (uint8_t*) advance, advance_len );
+
+    const int processed_before = diff->num_processed;
+    const uint64_t invalid_before = reliable_endpoint_counters( diff->endpoint )[RELIABLE_ENDPOINT_COUNTER_NUM_FRAGMENTS_INVALID];
+
+    reliable_endpoint_receive_packet( diff->endpoint, (uint8_t*) fragment1, fragment1_len );
+    if ( fragment2_len > 0 )
+        reliable_endpoint_receive_packet( diff->endpoint, (uint8_t*) fragment2, fragment2_len );
+
+    const uint64_t invalid_after = reliable_endpoint_counters( diff->endpoint )[RELIABLE_ENDPOINT_COUNTER_NUM_FRAGMENTS_INVALID];
+    const int refused = invalid_after != invalid_before;
+
+    reliable_endpoint_receive_packet( diff->endpoint, (uint8_t*) genuine, genuine_len );
+
+    const int delivered = diff->num_processed != processed_before;
+
+    RELIABLE_CONST uint64_t * counters = reliable_endpoint_counters( diff->endpoint );
+
+    int written = snprintf( out, (size_t) cap, "%s %d %s %d ",
+        case_name, fragment_sequence, refused ? "refused" : "accepted", delivered ? 1 : 0 );
+    if ( written < 0 || written >= cap )
+    {
+        reliable_endpoint_destroy( diff->endpoint );
+        free( diff );
+        return -1;
+    }
+
+    for ( int i = 0; i < RELIABLE_ENDPOINT_NUM_COUNTERS; ++i )
+    {
+        int more = snprintf( out + written, (size_t) ( cap - written ), "%llu%s", (unsigned long long) counters[i], i + 1 < RELIABLE_ENDPOINT_NUM_COUNTERS ? " " : "" );
+        if ( more < 0 || more >= cap - written )
+        {
+            reliable_endpoint_destroy( diff->endpoint );
+            free( diff );
+            return -1;
+        }
+        written += more;
+    }
+
+    reliable_endpoint_destroy( diff->endpoint );
+    free( diff );
+
+    return written;
+}
+

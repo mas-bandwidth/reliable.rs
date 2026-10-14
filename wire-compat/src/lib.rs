@@ -17,7 +17,7 @@
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::{c_int, c_void};
+    use std::ffi::{CString, c_char, c_int, c_void};
 
     use reliable::{Config, Counters, Endpoint};
 
@@ -571,6 +571,268 @@ mod tests {
             if c_line != rust_line {
                 panic!(
                     "transcript differs at input {n}:\n  C   : {c_line}\n  rust: {rust_line}"
+                );
+            }
+        }
+    }
+
+    // fragment oracle declarations. see wire-compat/c/shim.c.
+
+    unsafe extern "C" {
+        fn wire_compat_frag_oracle(
+            case_name: *const c_char,
+            fragment_above: c_int,
+            fragment_sequence: c_int,
+            advance: *const u8,
+            advance_len: c_int,
+            fragment1: *const u8,
+            fragment1_len: c_int,
+            fragment2: *const u8,
+            fragment2_len: c_int,
+            genuine: *const u8,
+            genuine_len: c_int,
+            out: *mut u8,
+            cap: c_int,
+        ) -> c_int;
+    }
+
+    /// A regular packet at sequence 0, built by a Rust producer and fed byte-identically to
+    /// both implementations.
+    fn build_genuine_seq0() -> Vec<u8> {
+        let mut producer = Endpoint::new(
+            Config {
+                name: "producer".to_string(),
+                fragment_above: FRAGMENT_ABOVE,
+                ..Config::default()
+            },
+            100.0,
+        );
+        let mut datagrams: Vec<Vec<u8>> = Vec::new();
+        producer.send_packet(&[0u8; 8], |_, data| datagrams.push(data.to_vec()));
+        assert_eq!(datagrams.len(), 1);
+        datagrams.remove(0)
+    }
+
+    /// A regular packet at sequence 1000, fed first to advance a receiver's window to
+    /// 1001 before the crafted fragment arrives.
+    fn build_advance_seq1000() -> Vec<u8> {
+        let mut producer = Endpoint::new(
+            Config {
+                name: "advance".to_string(),
+                fragment_above: FRAGMENT_ABOVE,
+                ..Config::default()
+            },
+            100.0,
+        );
+        let mut packet: Vec<u8> = Vec::new();
+        for _ in 0..=1000 {
+            producer.send_packet(&[0u8; 8], |sequence, data| {
+                if sequence == 1000 {
+                    packet = data.to_vec();
+                }
+            });
+        }
+        assert!(!packet.is_empty());
+        packet
+    }
+
+    /// Case C: an in-order fragmented packet of 1.5 x fragment_size at sequence 0, which
+    /// reassembles from two fragments and delivers at full size.
+    fn build_case_c_fragments() -> Vec<Vec<u8>> {
+        let mut producer = Endpoint::new(
+            Config {
+                name: "c-producer".to_string(),
+                fragment_above: FRAGMENT_ABOVE,
+                ..Config::default()
+            },
+            100.0,
+        );
+        let fragment_size = producer.config().fragment_size;
+        let payload = vec![0u8; fragment_size + fragment_size / 2];
+        let mut datagrams: Vec<Vec<u8>> = Vec::new();
+        producer.send_packet(&payload, |_, data| datagrams.push(data.to_vec()));
+        assert!(datagrams.len() >= 2, "case C payload must fragment");
+        datagrams
+    }
+
+    /// A lone last fragment (id 1 of 2) at `sequence` with zero or one payload byte:
+    /// `[1, sequence_lo, sequence_hi, fragment_id, count - 1, payload..]`.
+    fn lone_last_fragment(sequence: u16, payload_bytes: usize) -> Vec<u8> {
+        let mut fragment = vec![
+            1u8,
+            (sequence & 0xFF) as u8,
+            ((sequence >> 8) & 0xFF) as u8,
+            1,
+            1,
+        ];
+        fragment.extend(std::iter::repeat_n(0u8, payload_bytes));
+        fragment
+    }
+
+    // one line per crafted input, byte-identical to the C shim's wire_compat_frag_oracle:
+    //   <case> <fragment seq> <refused|accepted> <genuine seq 0 delivered 0|1> <eleven counters>
+
+    fn rust_frag_line(
+        case_name: &str,
+        fragment_sequence: u16,
+        advance: Option<&[u8]>,
+        fragments: &[Vec<u8>],
+        genuine: &[u8],
+    ) -> String {
+        let mut endpoint = Endpoint::new(
+            Config {
+                name: "rust".to_string(),
+                fragment_above: FRAGMENT_ABOVE,
+                ..Config::default()
+            },
+            100.0,
+        );
+
+        if let Some(advance) = advance {
+            endpoint.receive_packet(advance, |_, _| true);
+        }
+
+        let invalid_before = endpoint.counters().num_fragments_invalid;
+        let mut num_processed = 0usize;
+
+        for fragment in fragments {
+            endpoint.receive_packet(fragment, |_, _| {
+                num_processed += 1;
+                true
+            });
+        }
+
+        let refused = endpoint.counters().num_fragments_invalid != invalid_before;
+
+        endpoint.receive_packet(genuine, |_, _| {
+            num_processed += 1;
+            true
+        });
+
+        let delivered = num_processed > 0;
+        let counters = counter_array(endpoint.counters());
+
+        let mut line = format!(
+            "{} {} {} {} ",
+            case_name,
+            fragment_sequence,
+            if refused { "refused" } else { "accepted" },
+            if delivered { 1 } else { 0 },
+        );
+        for (i, counter) in counters.iter().enumerate() {
+            if i + 1 < counters.len() {
+                line.push_str(&format!("{counter} "));
+            } else {
+                line.push_str(&format!("{counter}"));
+            }
+        }
+        line
+    }
+
+    fn c_frag_line(
+        case_name: &str,
+        fragment_sequence: u16,
+        advance: Option<&[u8]>,
+        fragments: &[Vec<u8>],
+        genuine: &[u8],
+    ) -> String {
+        let case = CString::new(case_name).expect("case name");
+        let (advance_ptr, advance_len) = match advance {
+            Some(advance) => (advance.as_ptr(), advance.len() as c_int),
+            None => (std::ptr::null(), 0),
+        };
+        let fragment1 = &fragments[0];
+        let fragment2 = fragments.get(1);
+
+        let mut out = vec![0u8; 4096];
+        let written = unsafe {
+            wire_compat_frag_oracle(
+                case.as_ptr(),
+                FRAGMENT_ABOVE as c_int,
+                fragment_sequence as c_int,
+                advance_ptr,
+                advance_len,
+                fragment1.as_ptr(),
+                fragment1.len() as c_int,
+                fragment2.map_or(std::ptr::null(), |fragment| fragment.as_ptr()),
+                fragment2.map_or(0, |fragment| fragment.len() as c_int),
+                genuine.as_ptr(),
+                genuine.len() as c_int,
+                out.as_mut_ptr(),
+                out.len() as c_int,
+            )
+        };
+        assert!(written >= 0, "wire_compat_frag_oracle output buffer too small");
+        String::from_utf8(out[..written as usize].to_vec()).expect("utf8 oracle line")
+    }
+
+    /// One crafted fragment input: case name, fragment sequence, optional advance packet,
+    /// fragment datagrams, then the genuine sequence 0 packet.
+    type FragInput = (String, u16, Option<Vec<u8>>, Vec<Vec<u8>>, Vec<u8>);
+
+    /// Differential test against the C reference for the fragment / received-window fix
+    /// (C reliable PR 68, merge dfd5541c): the crafted fragment sequences of C's cases A,
+    /// B and C, each followed by a genuine sequence 0, plus every fragment sequence in the
+    /// audit list fed to a cold receiver and to a receiver advanced to 1000, each as a lone
+    /// last fragment with zero and one payload byte. C and the port print one line per
+    /// input and the two transcripts must compare byte for byte.
+    ///
+    /// Gated on `RELIABLE_C_DIR` (used only to refresh the vendored C): when it is unset
+    /// the test skips with a loud message so the unit gate stays hermetic. Run:
+    ///
+    ///     cargo test --manifest-path wire-compat/Cargo.toml differential_fragments_against_c_reference
+    #[test]
+    fn differential_fragments_against_c_reference() {
+        if std::env::var_os("RELIABLE_C_DIR").is_none() {
+            eprintln!(
+                "SKIP differential_fragments_against_c_reference: RELIABLE_C_DIR is unset; \
+                 no C checkout holding the fragment / received-window fix (PR 68, merge \
+                 dfd5541c) is reachable, so this leg is not-done. Refresh wire-compat/c from \
+                 such a checkout, then run `cargo test --manifest-path wire-compat/Cargo.toml \
+                 differential_fragments_against_c_reference`."
+            );
+            return;
+        }
+
+        let genuine = build_genuine_seq0();
+        let advance = build_advance_seq1000();
+        let case_c = build_case_c_fragments();
+
+        let mut inputs: Vec<FragInput> = vec![
+            ("A".to_string(), 512, None, vec![lone_last_fragment(512, 0)], genuine.clone()),
+            ("A-one".to_string(), 512, None, vec![lone_last_fragment(512, 1)], genuine.clone()),
+            ("B".to_string(), 32512, None, vec![lone_last_fragment(32512, 0)], genuine.clone()),
+            ("C".to_string(), 0, None, case_c.clone(), genuine.clone()),
+        ];
+
+        for sequence in [
+            0u16, 1, 255, 256, 511, 512, 513, 32511, 32512, 32513, 32768, 65280, 65535,
+        ] {
+            for (state, advance) in [("cold", None), ("adv", Some(advance.clone()))] {
+                for payload_bytes in [0usize, 1] {
+                    inputs.push((
+                        format!("{sequence}-{state}-{payload_bytes}"),
+                        sequence,
+                        advance.clone(),
+                        vec![lone_last_fragment(sequence, payload_bytes)],
+                        genuine.clone(),
+                    ));
+                }
+            }
+        }
+
+        let mut c_lines: Vec<String> = Vec::new();
+        let mut rust_lines: Vec<String> = Vec::new();
+
+        for (case_name, sequence, advance, fragments, genuine) in &inputs {
+            c_lines.push(c_frag_line(case_name, *sequence, advance.as_deref(), fragments, genuine));
+            rust_lines.push(rust_frag_line(case_name, *sequence, advance.as_deref(), fragments, genuine));
+        }
+
+        for ((case_name, _, _, _, _), (c_line, rust_line)) in inputs.iter().zip(c_lines.iter().zip(rust_lines.iter())) {
+            if c_line != rust_line {
+                panic!(
+                    "transcript differs at case {case_name}:\n  C   : {c_line}\n  rust: {rust_line}"
                 );
             }
         }

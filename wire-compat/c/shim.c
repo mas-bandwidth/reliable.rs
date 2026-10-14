@@ -31,6 +31,7 @@ struct reliable_endpoint_t * wire_compat_endpoint_create( int fragment_above,
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 struct wire_compat_diff_t
 {
@@ -222,5 +223,127 @@ int wire_compat_frag_oracle( const char * case_name,
     free( diff );
 
     return written;
+}
+
+// ---------------------------------------------------------------
+// config oracle
+//
+// creates a C endpoint with one sequence buffer field set to a value and every other field
+// at its default, then, when the endpoint is created, builds a default peer and sends one
+// one-byte packet each way to learn whether the peer acks the one-byte send. prints one
+// line per input:
+//   <field> <value> <created|refused> ack <sent bytes acknowledged by a peer>
+// the ack token is absent when the config is refused. returns the bytes written, excluding
+// the terminator, or -1 if the output buffer is too small.
+
+struct wire_compat_config_node_t
+{
+    struct reliable_endpoint_t * peer;
+};
+
+static void wire_compat_config_transmit( void * context, uint64_t id, uint16_t sequence, uint8_t * packet_data, int packet_bytes )
+{
+    (void) id; (void) sequence;
+    struct wire_compat_config_node_t * node = (struct wire_compat_config_node_t*) context;
+    if ( node->peer )
+        reliable_endpoint_receive_packet( node->peer, packet_data, packet_bytes );
+}
+
+static int wire_compat_config_process( void * context, uint64_t id, uint16_t sequence, uint8_t * packet_data, int packet_bytes )
+{
+    (void) context; (void) id; (void) sequence; (void) packet_data; (void) packet_bytes;
+    return 1;
+}
+
+static uint64_t wire_compat_config_measure_ack( struct reliable_endpoint_t * sender, struct reliable_endpoint_t * receiver )
+{
+    uint8_t payload[1] = { 0 };
+    reliable_endpoint_send_packet( sender, payload, 1 );
+    reliable_endpoint_send_packet( receiver, payload, 1 );
+    reliable_endpoint_update( sender, 100.01 );
+    reliable_endpoint_update( receiver, 100.01 );
+
+    int num_acks = 0;
+    RELIABLE_CONST uint16_t * acks = reliable_endpoint_get_acks( sender, &num_acks );
+    for ( int i = 0; i < num_acks; ++i )
+    {
+        if ( acks[i] == 0 )
+            return 1;
+    }
+    return 0;
+}
+
+static int wire_compat_config_line( struct reliable_config_t * config, const char * field, long long value, char * out, int cap )
+{
+    struct wire_compat_config_node_t sender_node;
+    struct wire_compat_config_node_t receiver_node;
+    memset( &sender_node, 0, sizeof( sender_node ) );
+    memset( &receiver_node, 0, sizeof( receiver_node ) );
+
+    config->context = &sender_node;
+    config->transmit_packet_function = wire_compat_config_transmit;
+    config->process_packet_function = wire_compat_config_process;
+
+    struct reliable_endpoint_t * sender = reliable_endpoint_create( config, 100.0 );
+    if ( !sender )
+        return snprintf( out, (size_t) cap, "%s %lld refused", field, value );
+
+    struct reliable_config_t receiver_config;
+    reliable_default_config( &receiver_config );
+    receiver_config.id = 1;
+    receiver_config.context = &receiver_node;
+    receiver_config.transmit_packet_function = wire_compat_config_transmit;
+    receiver_config.process_packet_function = wire_compat_config_process;
+
+    struct reliable_endpoint_t * receiver = reliable_endpoint_create( &receiver_config, 100.0 );
+    if ( !receiver )
+    {
+        reliable_endpoint_destroy( sender );
+        return -1;
+    }
+
+    sender_node.peer = receiver;
+    receiver_node.peer = sender;
+
+    uint64_t bytes_acked = wire_compat_config_measure_ack( sender, receiver );
+
+    reliable_endpoint_destroy( sender );
+    reliable_endpoint_destroy( receiver );
+
+    return snprintf( out, (size_t) cap, "%s %lld created ack %llu", field, value, (unsigned long long) bytes_acked );
+}
+
+int wire_compat_config_buffer_oracle( const char * field, long long value, char * out, int cap )
+{
+    struct reliable_config_t config;
+    reliable_default_config( &config );
+
+    if ( strcmp( field, "sent_packets_buffer_size" ) == 0 )
+        config.sent_packets_buffer_size = (int) value;
+    else if ( strcmp( field, "received_packets_buffer_size" ) == 0 )
+        config.received_packets_buffer_size = (int) value;
+    else if ( strcmp( field, "fragment_reassembly_buffer_size" ) == 0 )
+        config.fragment_reassembly_buffer_size = (int) value;
+    else
+        return -1;
+
+    return wire_compat_config_line( &config, field, value, out, cap );
+}
+
+// the R4 edge: packet_header_size plus max_packet_size plus the largest packet and fragment
+// headers must fit INT_MAX, computed in 64 bits so the sum cannot wrap. the fragment
+// geometry is one fragment the size of the packet, so no other check is the deciding one.
+
+int wire_compat_config_length_oracle( int packet_header_size, long long max_packet_size, char * out, int cap )
+{
+    struct reliable_config_t config;
+    reliable_default_config( &config );
+    config.packet_header_size = packet_header_size;
+    config.max_packet_size = (int) max_packet_size;
+    config.fragment_above = 1024;
+    config.max_fragments = 1;
+    config.fragment_size = (int) max_packet_size;
+
+    return wire_compat_config_line( &config, "packet_header_size+max_packet_size", max_packet_size, out, cap );
 }
 

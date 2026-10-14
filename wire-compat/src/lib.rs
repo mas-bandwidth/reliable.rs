@@ -17,7 +17,7 @@
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::{CString, c_char, c_int, c_void};
+    use std::ffi::{CString, c_char, c_int, c_longlong, c_void};
 
     use reliable::{Config, Counters, Endpoint};
 
@@ -913,6 +913,179 @@ mod tests {
                 panic!(
                     "transcript differs at input {n}:\n  C   : {c_line}\n  rust: {rust_line}"
                 );
+            }
+        }
+    }
+
+    // config oracle declarations. see wire-compat/c/shim.c.
+
+    unsafe extern "C" {
+        fn wire_compat_config_buffer_oracle(
+            field: *const c_char,
+            value: c_longlong,
+            out: *mut u8,
+            cap: c_int,
+        ) -> c_int;
+        fn wire_compat_config_length_oracle(
+            packet_header_size: c_int,
+            max_packet_size: c_longlong,
+            out: *mut u8,
+            cap: c_int,
+        ) -> c_int;
+    }
+
+    // one line per input, byte-identical to the C shim's config oracle:
+    //   <field> <value> <created|refused> [ack <sent bytes acked by a peer>]
+
+    fn config_buffer_config(field: &str, value: usize) -> Config {
+        match field {
+            "sent_packets_buffer_size" => Config {
+                sent_packets_buffer_size: value,
+                ..Config::default()
+            },
+            "received_packets_buffer_size" => Config {
+                received_packets_buffer_size: value,
+                ..Config::default()
+            },
+            "fragment_reassembly_buffer_size" => Config {
+                fragment_reassembly_buffer_size: value,
+                ..Config::default()
+            },
+            _ => unreachable!("unknown sequence buffer field"),
+        }
+    }
+
+    fn measure_config_ack(mut sender: Endpoint) -> u64 {
+        let mut receiver = Endpoint::new(Config::default(), 100.0);
+        sender.send_packet(&[0u8], |_, data| {
+            receiver.receive_packet(data, |_, _| true);
+        });
+        receiver.send_packet(&[0u8], |_, data| {
+            sender.receive_packet(data, |_, _| true);
+        });
+        sender.update(100.01);
+        receiver.update(100.01);
+        if sender.acks().contains(&0) { 1 } else { 0 }
+    }
+
+    fn rust_config_buffer_line(field: &str, value: usize) -> String {
+        let config = config_buffer_config(field, value);
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Endpoint::new(config, 100.0)
+        })) {
+            Err(_) => format!("{field} {value} refused"),
+            Ok(sender) => {
+                let bytes_acked = measure_config_ack(sender);
+                format!("{field} {value} created ack {bytes_acked}")
+            }
+        }
+    }
+
+    fn rust_config_length_line(packet_header_size: usize, max_packet_size: usize) -> String {
+        let config = Config {
+            packet_header_size,
+            max_packet_size,
+            fragment_above: 1024,
+            max_fragments: 1,
+            fragment_size: max_packet_size,
+            ..Config::default()
+        };
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Endpoint::new(config, 100.0)
+        })) {
+            Err(_) => format!("packet_header_size+max_packet_size {max_packet_size} refused"),
+            Ok(sender) => {
+                let bytes_acked = measure_config_ack(sender);
+                format!("packet_header_size+max_packet_size {max_packet_size} created ack {bytes_acked}")
+            }
+        }
+    }
+
+    /// Differential test against the C reference for the sequence-buffer size and
+    /// received-bytes fixes (C 7862477e): each of the three sequence-buffer fields at
+    /// 0, 1, 2, 3, 100, 255, 256, 257, 16383, 16384, 16385, 32768, 65535, 65536 and 65537
+    /// with every other field at its default, and the packet_header_size + max_packet_size
+    /// edge configs at INT_MAX - 14 - 28, one above it, and header 9 at INT_MAX - 23. Each
+    /// side prints one line per config and the two transcripts must compare byte for byte.
+    ///
+    /// Gated on `RELIABLE_C_DIR` (used only to refresh the vendored C): when it is unset the
+    /// test skips with a loud message so the unit gate stays hermetic. Run:
+    ///
+    ///     cargo test --manifest-path wire-compat/Cargo.toml differential_config_against_c_reference
+    #[test]
+    fn differential_config_against_c_reference() {
+        if std::env::var_os("RELIABLE_C_DIR").is_none() {
+            eprintln!(
+                "SKIP differential_config_against_c_reference: RELIABLE_C_DIR is unset; no C \
+                 checkout holding the sequence-buffer size and received-bytes fixes (C 7862477e) \
+                 is reachable, so this leg is not-done. Refresh wire-compat/c from such a \
+                 checkout, then run `cargo test --manifest-path wire-compat/Cargo.toml \
+                 differential_config_against_c_reference`."
+            );
+            return;
+        }
+
+        const FIELDS: [&str; 3] = [
+            "sent_packets_buffer_size",
+            "received_packets_buffer_size",
+            "fragment_reassembly_buffer_size",
+        ];
+        const SIZES: [usize; 15] = [
+            0, 1, 2, 3, 100, 255, 256, 257, 16383, 16384, 16385, 32768, 65535, 65536, 65537,
+        ];
+
+        let int_max = c_longlong::from(i32::MAX);
+        let length_inputs: [(c_int, c_longlong); 3] = [
+            (28, int_max - 14 - 28),
+            (28, int_max - 14 - 28 + 1),
+            (9, int_max - 23),
+        ];
+
+        let mut c_lines: Vec<String> = Vec::new();
+        let mut rust_lines: Vec<String> = Vec::new();
+        let mut out = vec![0u8; 4096];
+
+        for field in FIELDS {
+            for value in SIZES {
+                let c_field = CString::new(field).expect("field name");
+                let written = unsafe {
+                    wire_compat_config_buffer_oracle(
+                        c_field.as_ptr(),
+                        value as c_longlong,
+                        out.as_mut_ptr(),
+                        out.len() as c_int,
+                    )
+                };
+                assert!(written >= 0, "config oracle output buffer too small");
+                c_lines.push(
+                    String::from_utf8(out[..written as usize].to_vec()).expect("utf8 config line"),
+                );
+                rust_lines.push(rust_config_buffer_line(field, value));
+            }
+        }
+
+        for (packet_header_size, max_packet_size) in length_inputs {
+            let written = unsafe {
+                wire_compat_config_length_oracle(
+                    packet_header_size,
+                    max_packet_size,
+                    out.as_mut_ptr(),
+                    out.len() as c_int,
+                )
+            };
+            assert!(written >= 0, "config oracle output buffer too small");
+            c_lines.push(
+                String::from_utf8(out[..written as usize].to_vec()).expect("utf8 config line"),
+            );
+            rust_lines.push(rust_config_length_line(
+                packet_header_size as usize,
+                max_packet_size as usize,
+            ));
+        }
+
+        for (n, (c_line, rust_line)) in c_lines.iter().zip(rust_lines.iter()).enumerate() {
+            if c_line != rust_line {
+                panic!("transcript differs at config {n}:\n  C   : {c_line}\n  rust: {rust_line}");
             }
         }
     }

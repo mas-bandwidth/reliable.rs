@@ -36,6 +36,11 @@ pub struct Config {
     /// Number of packets that can be under reassembly from fragments at the same time.
     /// Must be a power of two no larger than 16384.
     pub fragment_reassembly_buffer_size: usize,
+    /// Maximum bytes of unfinished reassembly held at the same time. A first fragment
+    /// whose allocation would push the outstanding reassembly bytes past this budget is
+    /// refused and counted `num_fragments_invalid`. `0` disables the budget (the old
+    /// unbounded behaviour).
+    pub fragment_reassembly_byte_budget: usize,
     /// Exponential smoothing factor for the rtt moving average.
     pub rtt_smoothing_factor: f32,
     /// Number of rtt samples kept for min/max/avg rtt and jitter.
@@ -60,6 +65,7 @@ impl Default for Config {
             sent_packets_buffer_size: 256,
             received_packets_buffer_size: 256,
             fragment_reassembly_buffer_size: 64,
+            fragment_reassembly_byte_budget: 256 * 1024,
             rtt_smoothing_factor: 0.0025,
             rtt_history_size: 512,
             packet_loss_smoothing_factor: 0.1,
@@ -685,6 +691,36 @@ impl Endpoint {
             }
 
             if !self.fragment_reassembly.exists(fragment_header.sequence) {
+                let packet_buffer_size = MAX_PACKET_HEADER_BYTES
+                    + fragment_header.num_fragments * self.config.fragment_size;
+
+                // the buffer has no free callback, so the outstanding bytes are recomputed
+                // from the live entries rather than kept in a running total that eviction,
+                // completion and reset would not decrement
+
+                if self.config.fragment_reassembly_byte_budget != 0 {
+                    let outstanding: usize = self
+                        .fragment_reassembly
+                        .iter()
+                        .map(|entry| entry.packet_data.capacity())
+                        .sum();
+                    if outstanding + packet_buffer_size
+                        > self.config.fragment_reassembly_byte_budget
+                    {
+                        debug!(
+                            "[{}] refusing fragment {} of packet {}. {} outstanding reassembly bytes plus {} would exceed the budget {}",
+                            self.config.name,
+                            fragment_header.fragment_id,
+                            fragment_header.sequence,
+                            outstanding,
+                            packet_buffer_size,
+                            self.config.fragment_reassembly_byte_budget
+                        );
+                        self.counters.num_fragments_invalid += 1;
+                        return;
+                    }
+                }
+
                 let Some(reassembly_data) = self
                     .fragment_reassembly
                     .insert_advance_first(fragment_header.sequence)
@@ -696,9 +732,6 @@ impl Endpoint {
                     self.counters.num_fragments_invalid += 1;
                     return;
                 };
-
-                let packet_buffer_size = MAX_PACKET_HEADER_BYTES
-                    + fragment_header.num_fragments * self.config.fragment_size;
 
                 reassembly_data.num_fragments_total = fragment_header.num_fragments;
                 reassembly_data.packet_data = vec![0; packet_buffer_size];
@@ -1794,6 +1827,68 @@ mod tests {
                 assert!(entry.packet_data.is_empty());
             }
         }
+    }
+
+    #[test]
+    fn unfinished_reassembly_respects_byte_budget() {
+        const BUDGET: usize = 64 * 1024;
+
+        // a first fragment allocates and zeroes room for every fragment its header claims.
+        // a flood of lone last fragments that never complete must not grow the live
+        // reassembly bytes past the budget: the ones that would are refused and counted.
+
+        let mut receiver = Endpoint::new(
+            Config {
+                fragment_reassembly_byte_budget: BUDGET,
+                ..test_config("receiver")
+            },
+            100.0,
+        );
+
+        // the room one of these fragments claims: the largest packet header plus sixteen
+        // fragments at the default fragment size
+        let slot_bytes = MAX_PACKET_HEADER_BYTES
+            + receiver.config().max_fragments * receiver.config().fragment_size;
+
+        let mut num_refused = 0u64;
+
+        for sequence in 0..64u16 {
+            // a last fragment (id 15 of 16) with no payload: it creates the reassembly
+            // entry and claims room for all sixteen fragments
+            let fragment = [1u8, (sequence & 0xFF) as u8, (sequence >> 8) as u8, 15, 15];
+
+            let invalid_before = receiver.counters().num_fragments_invalid;
+            receiver.receive_packet(&fragment, |_, _| true);
+            if receiver.counters().num_fragments_invalid != invalid_before {
+                num_refused += 1;
+            }
+
+            let outstanding: usize = (0..receiver.fragment_reassembly.num_entries())
+                .map(|index| receiver.fragment_reassembly.raw_entry(index))
+                .filter(|(entry_sequence, _)| entry_sequence.is_some())
+                .map(|(_, entry)| entry.packet_data.capacity())
+                .sum();
+
+            assert!(
+                outstanding <= BUDGET + slot_bytes,
+                "outstanding reassembly bytes {outstanding} exceed the budget plus one slot"
+            );
+        }
+
+        assert!(num_refused > 0, "the budget must refuse some fragments");
+        assert_eq!(num_refused, receiver.counters().num_fragments_invalid);
+
+        // a budget below one maximal reassembly refuses the very first fragment
+        let mut tiny = Endpoint::new(
+            Config {
+                fragment_reassembly_byte_budget: slot_bytes - 1,
+                ..test_config("tiny")
+            },
+            100.0,
+        );
+        tiny.receive_packet(&[1u8, 0, 0, 15, 15], |_, _| true);
+        assert_eq!(tiny.counters().num_fragments_invalid, 1);
+        assert!(!tiny.fragment_reassembly.exists(0));
     }
 
     #[test]

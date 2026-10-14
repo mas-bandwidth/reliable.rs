@@ -31,6 +31,17 @@ impl<T: Default> SequenceBuffer<T> {
         self.entries.len()
     }
 
+    /// Iterates over the live (currently inserted) entries, in slot order. Used where a
+    /// running total would go stale: eviction, reset and remove replace an entry with its
+    /// default without a callback, so the total has to be recomputed from the buffer.
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
+        let entry_sequence = &self.entry_sequence;
+        self.entries
+            .iter()
+            .enumerate()
+            .filter_map(move |(index, entry)| entry_sequence[index].is_some().then_some(entry))
+    }
+
     pub fn reset(&mut self) {
         self.sequence = 0;
         self.entry_sequence.fill(None);

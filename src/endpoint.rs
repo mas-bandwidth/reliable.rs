@@ -1372,6 +1372,22 @@ mod tests {
         assert_eq!(receiver.counters().num_packets_stale, 1);
     }
 
+    // C reliable PR 69: an empty packet is counted invalid and ignored, never a panic.
+
+    #[test]
+    fn receive_empty_packet_is_counted_invalid() {
+        let mut receiver = Endpoint::new(test_config("receiver"), 100.0);
+
+        let mut process_ran = false;
+        receiver.receive_packet(&[], |_, _| {
+            process_ran = true;
+            true
+        });
+
+        assert!(!process_ran);
+        assert_eq!(receiver.counters().num_packets_invalid, 1);
+    }
+
     // C reliable PR 68 (merge dfd5541c): a fragment must not move the received
     // window before its reassembled packet is accepted. A fragment at a sequence
     // inside the window is held for reassembly only; one outside the window is

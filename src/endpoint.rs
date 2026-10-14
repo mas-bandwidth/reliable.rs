@@ -704,7 +704,8 @@ impl Endpoint {
                         .iter()
                         .map(|entry| entry.packet_data.capacity())
                         .sum();
-                    if outstanding + packet_buffer_size > self.config.fragment_reassembly_byte_budget
+                    if outstanding + packet_buffer_size
+                        > self.config.fragment_reassembly_byte_budget
                     {
                         debug!(
                             "[{}] refusing fragment {} of packet {}. {} outstanding reassembly bytes plus {} would exceed the budget {}",
@@ -1846,8 +1847,8 @@ mod tests {
 
         // the room one of these fragments claims: the largest packet header plus sixteen
         // fragments at the default fragment size
-        let slot_bytes =
-            MAX_PACKET_HEADER_BYTES + receiver.config().max_fragments * receiver.config().fragment_size;
+        let slot_bytes = MAX_PACKET_HEADER_BYTES
+            + receiver.config().max_fragments * receiver.config().fragment_size;
 
         let mut num_refused = 0u64;
 

@@ -475,6 +475,13 @@ mod tests {
     /// checklist item 5 shape that both sides can observe without aborting (oversize,
     /// truncated header, mismatched fragment count).
     ///
+    /// The fourth checklist-item-5 shape, a zero-length receive, is deliberately absent
+    /// from the transcript: both implementations abort on it rather than counting it — the
+    /// Rust port's `assert!(!packet_data.is_empty())` panics and the C reference's
+    /// `reliable_assert(packet_bytes > 0)` traps under `RELIABLE_DEBUG` (build.rs), so
+    /// neither side can yield a comparable "refused" line. That the two abort in the same
+    /// place is itself the finding (notes/c-parity-2026-10-14.md item 5).
+    ///
     /// Gated on `RELIABLE_C_DIR`, which is used only to refresh the vendored copy. When it
     /// is unset the test skips with a loud message, so the unit gate stays hermetic. Run:
     ///

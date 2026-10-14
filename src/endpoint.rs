@@ -1155,6 +1155,90 @@ mod tests {
         );
     }
 
+    // C 7862477e: reliable_config_valid refuses sent_packets_buffer_size,
+    // received_packets_buffer_size and fragment_reassembly_buffer_size unless each is a
+    // power of two no larger than 16384. A larger sequence buffer makes sequence 0 stale on
+    // a cold buffer, so the first send writes through a failed insert; a size that does not
+    // divide 65536 aliases after a wrap because remove_entries indexes the unreduced
+    // sequence. ack_buffer_size and rtt_history_size are not sequence buffers and keep
+    // their check.
+
+    fn sequence_buffer_size_config(field: &str, value: usize) -> Config {
+        match field {
+            "sent_packets_buffer_size" => Config {
+                sent_packets_buffer_size: value,
+                ..test_config("invalid-sequence-buffer")
+            },
+            "received_packets_buffer_size" => Config {
+                received_packets_buffer_size: value,
+                ..test_config("invalid-sequence-buffer")
+            },
+            "fragment_reassembly_buffer_size" => Config {
+                fragment_reassembly_buffer_size: value,
+                ..test_config("invalid-sequence-buffer")
+            },
+            _ => unreachable!("unknown sequence buffer field"),
+        }
+    }
+
+    #[test]
+    fn endpoint_rejects_sequence_buffer_sizes_that_c_refuses() {
+        for field in [
+            "sent_packets_buffer_size",
+            "received_packets_buffer_size",
+            "fragment_reassembly_buffer_size",
+        ] {
+            for value in [100usize, 32768, 65535, 65536] {
+                let config = sequence_buffer_size_config(field, value);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    Endpoint::new(config, 0.0);
+                }));
+                let payload = result.unwrap_err();
+                let message = payload
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| payload.downcast_ref::<&str>().copied())
+                    .unwrap_or("");
+                let expected =
+                    format!("config.{field} must be a power of two no larger than 16384");
+                assert!(
+                    message.contains(&expected),
+                    "{field} = {value} was not refused with {expected:?} (message {message:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn endpoint_accepts_sequence_buffer_sizes_a_c_peer_acks() {
+        for field in [
+            "sent_packets_buffer_size",
+            "received_packets_buffer_size",
+            "fragment_reassembly_buffer_size",
+        ] {
+            for value in [16384usize, 256] {
+                let mut sender = Endpoint::new(sequence_buffer_size_config(field, value), 100.0);
+                let mut receiver = Endpoint::new(test_config("receiver"), 100.0);
+
+                let dummy_packet = [0u8; 1];
+                sender.send_packet(&dummy_packet, |_, data| {
+                    receiver.receive_packet(data, |_, _| true);
+                });
+                receiver.send_packet(&dummy_packet, |_, data| {
+                    sender.receive_packet(data, |_, _| true);
+                });
+
+                sender.update(100.01);
+                receiver.update(100.01);
+
+                assert!(
+                    sender.acks().contains(&0),
+                    "{field} = {value} was accepted but a one-byte send was not acked"
+                );
+            }
+        }
+    }
+
     fn generate_packet_data_with_size(sequence: u16, packet_bytes: usize) -> Vec<u8> {
         assert!(packet_bytes >= 2);
         assert!(packet_bytes <= TEST_MAX_PACKET_BYTES);

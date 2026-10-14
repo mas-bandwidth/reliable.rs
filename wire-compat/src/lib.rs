@@ -916,4 +916,46 @@ mod tests {
             }
         }
     }
+
+    /// Differential test against the C reference for the unfinished-reassembly byte
+    /// budget (C card relfix-unfinished-reassembly-has-a-byte-budget). The inputs are the
+    /// C test's 64 crafted last fragments (id 15 of 16, sequences 0..63) with the budget at
+    /// 64 KB, then the same with the budget 0, then a complete fragmented packet of
+    /// 1.5 x fragment_size within the budget, each followed by a genuine packet. Both sides
+    /// print one line per input, `<step> <fragment refused|accepted> <outstanding
+    /// reassembly bytes> <the eleven counters>`, and the two transcripts must compare byte
+    /// for byte.
+    ///
+    /// This leg is not-done in this job: `RELIABLE_C_DIR` is unset and the vendored C in
+    /// `wire-compat/c/` predates the fix, so no C reference holding the budget is reachable
+    /// and neither the budgeted C config field nor a C outstanding-bytes accessor exists to
+    /// build the oracle against. The test is committed so it is ready once the vendored C is
+    /// refreshed. It skips with a loud message, so the unit gate stays hermetic. Run:
+    ///
+    ///     cargo test --manifest-path wire-compat/Cargo.toml differential_unfinished_reassembly_byte_budget_against_c_reference
+    #[test]
+    fn differential_unfinished_reassembly_byte_budget_against_c_reference() {
+        if std::env::var_os("RELIABLE_C_DIR").is_none() {
+            eprintln!(
+                "SKIP differential_unfinished_reassembly_byte_budget_against_c_reference: \
+                 RELIABLE_C_DIR is unset; no C checkout holding \
+                 relfix-unfinished-reassembly-has-a-byte-budget is reachable, so this leg is \
+                 not-done. Set RELIABLE_C_DIR to a mas-bandwidth/reliable checkout at \
+                 sprint/reliable-audit-fixes at or after that fix, refresh wire-compat/c, add \
+                 the budget oracle to wire-compat/c/shim.c, then run `cargo test \
+                 --manifest-path wire-compat/Cargo.toml \
+                 differential_unfinished_reassembly_byte_budget_against_c_reference`."
+            );
+            return;
+        }
+
+        // the oracle needs the budgeted C config field and a C accessor for the outstanding
+        // reassembly bytes; the reachable C reference exposes neither, so the comparison
+        // cannot be built. reported not-done rather than compared against a stale C.
+        eprintln!(
+            "NOT-DONE differential_unfinished_reassembly_byte_budget_against_c_reference: the \
+             reachable C reference does not expose the budget field or outstanding \
+             reassembly bytes; refresh wire-compat/c from the fixed C and add the oracle."
+        );
+    }
 }

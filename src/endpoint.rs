@@ -28,10 +28,13 @@ pub struct Config {
     /// Maximum number of acks buffered between calls to [`Endpoint::clear_acks`].
     pub ack_buffer_size: usize,
     /// Number of sent packets tracked for acks, packet loss and bandwidth stats.
+    /// Must be a power of two no larger than 16384.
     pub sent_packets_buffer_size: usize,
     /// Number of received packets tracked. Also the window for stale and duplicate packet rejection.
+    /// Must be a power of two no larger than 16384.
     pub received_packets_buffer_size: usize,
     /// Number of packets that can be under reassembly from fragments at the same time.
+    /// Must be a power of two no larger than 16384.
     pub fragment_reassembly_buffer_size: usize,
     /// Exponential smoothing factor for the rtt moving average.
     pub rtt_smoothing_factor: f32,
@@ -260,9 +263,10 @@ impl Endpoint {
     /// # Panics
     ///
     /// Panics if the config is invalid: zero sizes, `max_fragments > 256`,
-    /// `fragment_above > max_packet_size`, insufficient fragment capacity, or a
-    /// fragment capacity or `packet_header_size` that makes a packet length overflow
-    /// the `u32` the port carries lengths in.
+    /// `fragment_above > max_packet_size`, insufficient fragment capacity, a sequence
+    /// buffer size that is not a power of two no larger than 16384, or a fragment
+    /// capacity or `packet_header_size` that makes a packet length overflow the `u32`
+    /// the port carries lengths in.
     pub fn new(config: Config, time: f64) -> Self {
         assert!(config.max_packet_size > 0);
         assert!(config.fragment_above > 0);
@@ -292,6 +296,27 @@ impl Endpoint {
         assert!(config.received_packets_buffer_size > 0);
         assert!(config.fragment_reassembly_buffer_size > 0);
         assert!(config.rtt_history_size > 0);
+
+        // C 7862477e: the three sequence buffers must each be a power of two no larger than
+        // 16384. A larger size makes sequence 0 stale on a cold buffer, so the first send
+        // writes through a failed insert; a size that does not divide 65536 aliases after a
+        // wrap because remove_entries indexes the unreduced sequence. ack_buffer_size and
+        // rtt_history_size are not sequence buffers and keep their check.
+        assert!(
+            config.sent_packets_buffer_size.is_power_of_two()
+                && config.sent_packets_buffer_size <= 16384,
+            "config.sent_packets_buffer_size must be a power of two no larger than 16384"
+        );
+        assert!(
+            config.received_packets_buffer_size.is_power_of_two()
+                && config.received_packets_buffer_size <= 16384,
+            "config.received_packets_buffer_size must be a power of two no larger than 16384"
+        );
+        assert!(
+            config.fragment_reassembly_buffer_size.is_power_of_two()
+                && config.fragment_reassembly_buffer_size <= 16384,
+            "config.fragment_reassembly_buffer_size must be a power of two no larger than 16384"
+        );
 
         // C 1.4.3 (6055a51), reliable.c:644:
         //     if ( (int64_t) config->packet_header_size + (int64_t) config->max_packet_size > INT_MAX )
@@ -1153,6 +1178,90 @@ mod tests {
             endpoint.config().max_fragments * endpoint.config().fragment_size,
             1000
         );
+    }
+
+    // C 7862477e: reliable_config_valid refuses sent_packets_buffer_size,
+    // received_packets_buffer_size and fragment_reassembly_buffer_size unless each is a
+    // power of two no larger than 16384. A larger sequence buffer makes sequence 0 stale on
+    // a cold buffer, so the first send writes through a failed insert; a size that does not
+    // divide 65536 aliases after a wrap because remove_entries indexes the unreduced
+    // sequence. ack_buffer_size and rtt_history_size are not sequence buffers and keep
+    // their check.
+
+    fn sequence_buffer_size_config(field: &str, value: usize) -> Config {
+        match field {
+            "sent_packets_buffer_size" => Config {
+                sent_packets_buffer_size: value,
+                ..test_config("invalid-sequence-buffer")
+            },
+            "received_packets_buffer_size" => Config {
+                received_packets_buffer_size: value,
+                ..test_config("invalid-sequence-buffer")
+            },
+            "fragment_reassembly_buffer_size" => Config {
+                fragment_reassembly_buffer_size: value,
+                ..test_config("invalid-sequence-buffer")
+            },
+            _ => unreachable!("unknown sequence buffer field"),
+        }
+    }
+
+    #[test]
+    fn endpoint_rejects_sequence_buffer_sizes_that_c_refuses() {
+        for field in [
+            "sent_packets_buffer_size",
+            "received_packets_buffer_size",
+            "fragment_reassembly_buffer_size",
+        ] {
+            for value in [100usize, 32768, 65535, 65536] {
+                let config = sequence_buffer_size_config(field, value);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    Endpoint::new(config, 0.0);
+                }));
+                let payload = result.unwrap_err();
+                let message = payload
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| payload.downcast_ref::<&str>().copied())
+                    .unwrap_or("");
+                let expected =
+                    format!("config.{field} must be a power of two no larger than 16384");
+                assert!(
+                    message.contains(&expected),
+                    "{field} = {value} was not refused with {expected:?} (message {message:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn endpoint_accepts_sequence_buffer_sizes_a_c_peer_acks() {
+        for field in [
+            "sent_packets_buffer_size",
+            "received_packets_buffer_size",
+            "fragment_reassembly_buffer_size",
+        ] {
+            for value in [16384usize, 256] {
+                let mut sender = Endpoint::new(sequence_buffer_size_config(field, value), 100.0);
+                let mut receiver = Endpoint::new(test_config("receiver"), 100.0);
+
+                let dummy_packet = [0u8; 1];
+                sender.send_packet(&dummy_packet, |_, data| {
+                    receiver.receive_packet(data, |_, _| true);
+                });
+                receiver.send_packet(&dummy_packet, |_, data| {
+                    sender.receive_packet(data, |_, _| true);
+                });
+
+                sender.update(100.01);
+                receiver.update(100.01);
+
+                assert!(
+                    sender.acks().contains(&0),
+                    "{field} = {value} was accepted but a one-byte send was not acked"
+                );
+            }
+        }
     }
 
     fn generate_packet_data_with_size(sequence: u16, packet_bytes: usize) -> Vec<u8> {

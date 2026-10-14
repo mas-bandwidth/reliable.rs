@@ -1797,6 +1797,68 @@ mod tests {
     }
 
     #[test]
+    fn unfinished_reassembly_respects_byte_budget() {
+        const BUDGET: usize = 64 * 1024;
+
+        // a first fragment allocates and zeroes room for every fragment its header claims.
+        // a flood of lone last fragments that never complete must not grow the live
+        // reassembly bytes past the budget: the ones that would are refused and counted.
+
+        let mut receiver = Endpoint::new(
+            Config {
+                fragment_reassembly_byte_budget: BUDGET,
+                ..test_config("receiver")
+            },
+            100.0,
+        );
+
+        // the room one of these fragments claims: the largest packet header plus sixteen
+        // fragments at the default fragment size
+        let slot_bytes =
+            MAX_PACKET_HEADER_BYTES + receiver.config().max_fragments * receiver.config().fragment_size;
+
+        let mut num_refused = 0u64;
+
+        for sequence in 0..64u16 {
+            // a last fragment (id 15 of 16) with no payload: it creates the reassembly
+            // entry and claims room for all sixteen fragments
+            let fragment = [1u8, (sequence & 0xFF) as u8, (sequence >> 8) as u8, 15, 15];
+
+            let invalid_before = receiver.counters().num_fragments_invalid;
+            receiver.receive_packet(&fragment, |_, _| true);
+            if receiver.counters().num_fragments_invalid != invalid_before {
+                num_refused += 1;
+            }
+
+            let outstanding: usize = (0..receiver.fragment_reassembly.num_entries())
+                .map(|index| receiver.fragment_reassembly.raw_entry(index))
+                .filter(|(entry_sequence, _)| entry_sequence.is_some())
+                .map(|(_, entry)| entry.packet_data.capacity())
+                .sum();
+
+            assert!(
+                outstanding <= BUDGET + slot_bytes,
+                "outstanding reassembly bytes {outstanding} exceed the budget plus one slot"
+            );
+        }
+
+        assert!(num_refused > 0, "the budget must refuse some fragments");
+        assert_eq!(num_refused, receiver.counters().num_fragments_invalid);
+
+        // a budget below one maximal reassembly refuses the very first fragment
+        let mut tiny = Endpoint::new(
+            Config {
+                fragment_reassembly_byte_budget: slot_bytes - 1,
+                ..test_config("tiny")
+            },
+            100.0,
+        );
+        tiny.receive_packet(&[1u8, 0, 0, 15, 15], |_, _| true);
+        assert_eq!(tiny.counters().num_fragments_invalid, 1);
+        assert!(!tiny.fragment_reassembly.exists(0));
+    }
+
+    #[test]
     fn endpoint_reset() {
         let mut time = 100.0;
 

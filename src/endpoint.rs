@@ -474,9 +474,7 @@ impl Endpoint {
     /// the packet, false to reject it (rejected packets are not acked and may be
     /// processed again if they arrive again). Stale and duplicate packets are dropped.
     ///
-    /// # Panics
-    ///
-    /// Panics if `packet_data` is empty.
+    /// An empty packet is counted invalid and ignored.
     pub fn receive_packet(
         &mut self,
         packet_data: &[u8],
@@ -490,7 +488,11 @@ impl Endpoint {
         packet_data: &[u8],
         process: &mut dyn FnMut(u16, &[u8]) -> bool,
     ) {
-        assert!(!packet_data.is_empty());
+        if packet_data.is_empty() {
+            debug!("[{}] ignoring empty packet", self.config.name);
+            self.counters.num_packets_invalid += 1;
+            return;
+        }
 
         let packet_bytes = packet_data.len();
 

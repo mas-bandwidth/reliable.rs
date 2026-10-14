@@ -59,12 +59,15 @@ impl Link {
 }
 
 fn random_packet_data(rng: &mut Rng) -> Vec<u8> {
-    let packet_bytes = rng.range(1, MAX_PACKET_BYTES);
+    let packet_bytes = rng.range(0, MAX_PACKET_BYTES);
     (0..packet_bytes).map(|_| rng.next_u8()).collect()
 }
 
 fn send_random_packet(rng: &mut Rng, endpoint: &mut Endpoint, link: &mut Link) {
     let packet_data = random_packet_data(rng);
+    if packet_data.is_empty() {
+        return;
+    }
     endpoint.send_packet(&packet_data, |_, data| link.queue(data));
 }
 

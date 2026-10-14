@@ -645,6 +645,18 @@ impl Endpoint {
                 return;
             }
 
+            // a fragment outside the received window is stale and refused here, before
+            // any reassembly entry exists, matching the regular receive path
+
+            if !self.received_packets.can_insert(fragment_header.sequence) {
+                debug!(
+                    "[{}] ignoring stale fragment {} of packet {}",
+                    self.config.name, fragment_header.fragment_id, fragment_header.sequence
+                );
+                self.counters.num_fragments_invalid += 1;
+                return;
+            }
+
             if !self.fragment_reassembly.exists(fragment_header.sequence) {
                 let Some(reassembly_data) = self
                     .fragment_reassembly
@@ -664,7 +676,8 @@ impl Endpoint {
                 reassembly_data.num_fragments_total = fragment_header.num_fragments;
                 reassembly_data.packet_data = vec![0; packet_buffer_size];
 
-                self.received_packets.advance(fragment_header.sequence);
+                // the received window moves when the reassembled packet is accepted
+                // through the regular receive path, never when a fragment arrives
             }
 
             let reassembly_data = self

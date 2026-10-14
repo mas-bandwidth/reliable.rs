@@ -4,6 +4,15 @@ Versions track the upstream C library.
 
 ## Unreleased
 
+- Unfinished reassembly has a byte budget. `Config::fragment_reassembly_byte_budget`
+  (default 256 KB, `0` = unbounded) caps the bytes held by in-progress fragment
+  reassembly; a first fragment whose allocation would exceed the budget is refused and
+  counted `num_fragments_invalid`. This bounds the room a single unfinished reassembly
+  could otherwise claim for every fragment its header declares.
+- `Config` gains a field, so callers that build it as a struct literal must add
+  `fragment_reassembly_byte_budget` or spread `..Config::default()`; `Config` is not
+  `#[non_exhaustive]` and has all-public fields, so a literal that lists every field
+  stops compiling without the new one.
 - An empty packet received from the socket is counted invalid and ignored instead of
   panicking (C reliable PR 69, merge 190bce5b).
 

@@ -36,6 +36,11 @@ pub struct Config {
     /// Number of packets that can be under reassembly from fragments at the same time.
     /// Must be a power of two no larger than 16384.
     pub fragment_reassembly_buffer_size: usize,
+    /// Maximum bytes of unfinished reassembly held at the same time. A first fragment
+    /// whose allocation would push the outstanding reassembly bytes past this budget is
+    /// refused and counted `num_fragments_invalid`. `0` disables the budget (the old
+    /// unbounded behaviour).
+    pub fragment_reassembly_byte_budget: usize,
     /// Exponential smoothing factor for the rtt moving average.
     pub rtt_smoothing_factor: f32,
     /// Number of rtt samples kept for min/max/avg rtt and jitter.
@@ -60,6 +65,7 @@ impl Default for Config {
             sent_packets_buffer_size: 256,
             received_packets_buffer_size: 256,
             fragment_reassembly_buffer_size: 64,
+            fragment_reassembly_byte_budget: 256 * 1024,
             rtt_smoothing_factor: 0.0025,
             rtt_history_size: 512,
             packet_loss_smoothing_factor: 0.1,
@@ -685,6 +691,35 @@ impl Endpoint {
             }
 
             if !self.fragment_reassembly.exists(fragment_header.sequence) {
+                let packet_buffer_size = MAX_PACKET_HEADER_BYTES
+                    + fragment_header.num_fragments * self.config.fragment_size;
+
+                // the buffer has no free callback, so the outstanding bytes are recomputed
+                // from the live entries rather than kept in a running total that eviction,
+                // completion and reset would not decrement
+
+                if self.config.fragment_reassembly_byte_budget != 0 {
+                    let outstanding: usize = self
+                        .fragment_reassembly
+                        .iter()
+                        .map(|entry| entry.packet_data.capacity())
+                        .sum();
+                    if outstanding + packet_buffer_size > self.config.fragment_reassembly_byte_budget
+                    {
+                        debug!(
+                            "[{}] refusing fragment {} of packet {}. {} outstanding reassembly bytes plus {} would exceed the budget {}",
+                            self.config.name,
+                            fragment_header.fragment_id,
+                            fragment_header.sequence,
+                            outstanding,
+                            packet_buffer_size,
+                            self.config.fragment_reassembly_byte_budget
+                        );
+                        self.counters.num_fragments_invalid += 1;
+                        return;
+                    }
+                }
+
                 let Some(reassembly_data) = self
                     .fragment_reassembly
                     .insert_advance_first(fragment_header.sequence)
@@ -696,9 +731,6 @@ impl Endpoint {
                     self.counters.num_fragments_invalid += 1;
                     return;
                 };
-
-                let packet_buffer_size = MAX_PACKET_HEADER_BYTES
-                    + fragment_header.num_fragments * self.config.fragment_size;
 
                 reassembly_data.num_fragments_total = fragment_header.num_fragments;
                 reassembly_data.packet_data = vec![0; packet_buffer_size];

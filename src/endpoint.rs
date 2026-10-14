@@ -1359,6 +1359,68 @@ mod tests {
         assert_eq!(receiver.counters().num_packets_stale, 1);
     }
 
+    // C reliable PR 68 (merge dfd5541c): a fragment must not move the received
+    // window before its reassembled packet is accepted. A fragment at a sequence
+    // inside the window is held for reassembly only; one outside the window is
+    // refused and counted NUM_FRAGMENTS_INVALID before any reassembly entry exists.
+
+    #[test]
+    fn unfinished_fragment_does_not_stale_packets() {
+        // case A: sequence 512 is inside a cold receiver's window, so a lone last
+        // fragment (zero and one payload byte) is accepted for reassembly without
+        // moving the window; a genuine sequence 0 from a sender is still delivered
+
+        for fragment in [&[1, 0, 2, 1, 1][..], &[1, 0, 2, 1, 1, 0][..]] {
+            let mut receiver = Endpoint::new(test_config("receiver"), 100.0);
+            let mut num_processed = 0;
+
+            receiver.receive_packet(fragment, |_, _| {
+                num_processed += 1;
+                true
+            });
+
+            let mut sender = Endpoint::new(test_config("sender"), 100.0);
+            sender.send_packet(&[0u8; 8], |_, data| {
+                receiver.receive_packet(data, |sequence, _| {
+                    assert_eq!(sequence, 0);
+                    num_processed += 1;
+                    true
+                });
+            });
+
+            assert_eq!(num_processed, 1);
+            assert_eq!(receiver.counters().num_packets_stale, 0);
+        }
+
+        // case B: sequence 32512 is outside a cold receiver's window. the lone last
+        // fragment is refused and counted before any reassembly entry exists, and a
+        // genuine sequence 0 is still delivered
+
+        let mut receiver = Endpoint::new(test_config("receiver"), 100.0);
+        let mut num_processed = 0;
+
+        receiver.receive_packet(&[1, 0x00, 0x7F, 1, 1], |_, _| {
+            num_processed += 1;
+            true
+        });
+
+        assert_eq!(num_processed, 0);
+        assert_eq!(receiver.counters().num_fragments_invalid, 1);
+        assert!(!receiver.fragment_reassembly.exists(32512));
+
+        let mut sender = Endpoint::new(test_config("sender"), 100.0);
+        sender.send_packet(&[0u8; 8], |_, data| {
+            receiver.receive_packet(data, |sequence, _| {
+                assert_eq!(sequence, 0);
+                num_processed += 1;
+                true
+            });
+        });
+
+        assert_eq!(num_processed, 1);
+        assert_eq!(receiver.counters().num_packets_stale, 0);
+    }
+
     #[test]
     fn ack_buffer_overflow() {
         const NUM_PACKETS: usize = 32;

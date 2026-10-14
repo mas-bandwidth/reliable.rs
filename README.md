@@ -171,6 +171,12 @@ reliable is a packet acknowledgement system, not a full messaging layer. Keep th
 
 3. Endpoints are not thread safe. Use one endpoint per-thread, or protect each endpoint with your own lock.
 
+4. The sequence-buffer sizes — `sent_packets_buffer_size`, `received_packets_buffer_size`
+   and `fragment_reassembly_buffer_size` — must each be a power of two no larger than
+   16384. `Endpoint::new` panics otherwise: a larger buffer would make sequence 0 stale on
+   a cold endpoint, and a size that does not divide 65536 would alias after the sequence
+   wraps.
+
 # Author
 
 The author of this library is [Glenn Fiedler](https://www.linkedin.com/in/glenn-fiedler-11b735302/).

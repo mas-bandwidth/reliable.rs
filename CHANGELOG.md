@@ -7,6 +7,14 @@ Versions track the upstream C library.
 - An empty packet received from the socket is counted invalid and ignored instead of
   panicking (C reliable PR 69, merge 190bce5b).
 
+- `sent_packets_buffer_size`, `received_packets_buffer_size` and
+  `fragment_reassembly_buffer_size` are refused at create unless each is a power of two no
+  larger than 16384 (C `7862477e`). A larger sequence buffer makes sequence 0 stale on a
+  cold buffer, so the first send writes through a failed insert; a size that does not
+  divide 65536 aliases after the sequence wraps, because the buffer indexes the unreduced
+  sequence. `ack_buffer_size` and `rtt_history_size` are not sequence buffers and keep
+  their check.
+
 ## 1.4.5 (2026-09-13)
 
 Tracks C reliable 1.4.5. The vendored reference in `wire-compat/c/` moves from 1.3.4 to

@@ -19,7 +19,22 @@
 mod tests {
     use std::ffi::{c_int, c_void};
 
-    use reliable::{Config, Endpoint};
+    use reliable::{Config, Counters, Endpoint};
+
+    // differential oracle exports from the C shim. see wire-compat/c/shim.c.
+
+    unsafe extern "C" {
+        fn wire_compat_diff_create(fragment_above: c_int) -> *mut c_void;
+        fn wire_compat_diff_destroy(handle: *mut c_void);
+        fn wire_compat_diff_feed(
+            handle: *mut c_void,
+            data: *const u8,
+            len: c_int,
+            n: c_int,
+            out: *mut u8,
+            cap: c_int,
+        ) -> c_int;
+    }
 
     #[repr(C)]
     struct CEndpoint {
@@ -357,6 +372,207 @@ mod tests {
         unsafe {
             reliable_endpoint_destroy(c_a);
             reliable_endpoint_destroy(c_b);
+        }
+    }
+
+    // the eleven counters in reliable.h order, with the names the C shim prints.
+
+    const COUNTER_NAMES: [&str; 11] = [
+        "num_packets_sent",
+        "num_packets_received",
+        "num_packets_acked",
+        "num_packets_stale",
+        "num_packets_invalid",
+        "num_packets_too_large_to_send",
+        "num_packets_too_large_to_receive",
+        "num_fragments_sent",
+        "num_fragments_received",
+        "num_fragments_invalid",
+        "num_packets_duplicate",
+    ];
+
+    fn counter_array(counters: &Counters) -> [u64; 11] {
+        [
+            counters.num_packets_sent,
+            counters.num_packets_received,
+            counters.num_packets_acked,
+            counters.num_packets_stale,
+            counters.num_packets_invalid,
+            counters.num_packets_too_large_to_send,
+            counters.num_packets_too_large_to_receive,
+            counters.num_fragments_sent,
+            counters.num_fragments_received,
+            counters.num_fragments_invalid,
+            counters.num_packets_duplicate,
+        ]
+    }
+
+    // one line per input, byte-identical to the C shim's wire_compat_diff_feed format:
+    //   <n> <accepted|refused> <changed counter name or none> <seq:len | -> <eleven counters>
+
+    fn rust_diff_line(
+        n: usize,
+        endpoint: &mut Endpoint,
+        previous: &mut [u64; 11],
+        input: &[u8],
+    ) -> String {
+        let mut delivered: Option<(u16, usize)> = None;
+        endpoint.receive_packet(input, |sequence, payload| {
+            delivered = Some((sequence, payload.len()));
+            true
+        });
+
+        let counters = counter_array(endpoint.counters());
+
+        let mut changed = "none";
+        for (i, slot) in previous.iter_mut().enumerate() {
+            if counters[i] != *slot {
+                changed = COUNTER_NAMES[i];
+                break;
+            }
+        }
+        *previous = counters;
+
+        let mut line = format!(
+            "{} {} {} {} ",
+            n,
+            if delivered.is_some() { "accepted" } else { "refused" },
+            changed,
+            if delivered.is_some() { "" } else { "-" },
+        );
+        if let Some((sequence, bytes)) = delivered {
+            line.push_str(&format!("{sequence}:{bytes} "));
+        }
+        for (i, counter) in counters.iter().enumerate() {
+            if i + 1 < counters.len() {
+                line.push_str(&format!("{counter} "));
+            } else {
+                line.push_str(&format!("{counter}"));
+            }
+        }
+        line
+    }
+
+    fn c_diff_line(handle: *mut c_void, n: usize, input: &[u8]) -> String {
+        let mut out = vec![0u8; 4096];
+        let written = unsafe {
+            wire_compat_diff_feed(
+                handle,
+                input.as_ptr(),
+                input.len() as c_int,
+                n as c_int,
+                out.as_mut_ptr(),
+                out.len() as c_int,
+            )
+        };
+        assert!(written >= 0, "wire_compat_diff_feed output buffer too small");
+        String::from_utf8(out[..written as usize].to_vec()).expect("utf8 transcript line")
+    }
+
+    /// Differential test against the C reference: the SAME raw datagrams are fed to a C
+    /// endpoint and to the Rust port, in one process, and the two transcripts must compare
+    /// byte for byte. Covers valid regular traffic, fragments, and one hostile input per
+    /// checklist item 5 shape that both sides can observe without aborting (oversize,
+    /// truncated header, mismatched fragment count).
+    ///
+    /// The fourth checklist-item-5 shape, a zero-length receive, is deliberately absent
+    /// from the transcript: both implementations abort on it rather than counting it — the
+    /// Rust port's `assert!(!packet_data.is_empty())` panics and the C reference's
+    /// `reliable_assert(packet_bytes > 0)` traps under `RELIABLE_DEBUG` (build.rs), so
+    /// neither side can yield a comparable "refused" line. That the two abort in the same
+    /// place is itself the finding (notes/c-parity-2026-10-14.md item 5).
+    ///
+    /// Gated on `RELIABLE_C_DIR`, which is used only to refresh the vendored copy. When it
+    /// is unset the test skips with a loud message, so the unit gate stays hermetic. Run:
+    ///
+    ///     cargo test --manifest-path wire-compat/Cargo.toml differential_against_c_reference
+    #[test]
+    fn differential_against_c_reference() {
+        if std::env::var_os("RELIABLE_C_DIR").is_none() {
+            eprintln!(
+                "SKIP differential_against_c_reference: RELIABLE_C_DIR is unset; \
+                 no C checkout holding the audit fixes is reachable, so this leg is \
+                 not-done. Set RELIABLE_C_DIR to a mas-bandwidth/reliable checkout at \
+                 sprint/reliable-audit-fixes (>= 7862477e), refresh wire-compat/c, then \
+                 run `cargo test --manifest-path wire-compat/Cargo.toml \
+                 differential_against_c_reference`."
+            );
+            return;
+        }
+
+        const FRAGMENT_ABOVE: usize = 500;
+
+        // build the input vectors with a Rust endpoint pair, then feed the identical bytes
+        // to both implementations
+
+        let mut producer = Endpoint::new(
+            Config {
+                name: "producer".to_string(),
+                fragment_above: FRAGMENT_ABOVE,
+                ..Config::default()
+            },
+            100.0,
+        );
+
+        let mut inputs: Vec<Vec<u8>> = Vec::new();
+
+        // a valid regular packet
+        {
+            let mut datagrams: Vec<Vec<u8>> = Vec::new();
+            producer.send_packet(&[1, 2, 3], |_, data| datagrams.push(data.to_vec()));
+            inputs.extend(datagrams);
+        }
+
+        // a valid fragmented packet (spans the threshold, several fragments)
+        {
+            let payload = generate_payload(producer.next_packet_sequence());
+            let mut datagrams: Vec<Vec<u8>> = Vec::new();
+            producer.send_packet(&payload, |_, data| datagrams.push(data.to_vec()));
+            assert!(datagrams.len() > 1, "payload must fragment");
+            inputs.extend(datagrams);
+        }
+
+        // hostile: oversize (past max_packet_size + packet and fragment headers)
+        {
+            let max_packet_size = Config::default().max_packet_size;
+            inputs.push(vec![0u8; max_packet_size + 9 + 5 + 1]);
+        }
+
+        // hostile: truncated packet header
+        inputs.push(vec![0x00, 0x01]);
+
+        // hostile: mismatched fragment count (num_fragments above max_fragments)
+        inputs.push(vec![1, 0x00, 0x00, 0x00, 0xFF, 0x00]);
+
+        let diffs = unsafe { wire_compat_diff_create(FRAGMENT_ABOVE as c_int) };
+        assert!(!diffs.is_null(), "C differential endpoint create failed");
+
+        let mut c_lines: Vec<String> = Vec::new();
+        let mut rust_lines: Vec<String> = Vec::new();
+
+        let mut endpoint = Endpoint::new(
+            Config {
+                name: "rust".to_string(),
+                fragment_above: FRAGMENT_ABOVE,
+                ..Config::default()
+            },
+            100.0,
+        );
+        let mut previous = [0u64; 11];
+
+        for (n, input) in inputs.iter().enumerate() {
+            c_lines.push(c_diff_line(diffs, n, input));
+            rust_lines.push(rust_diff_line(n, &mut endpoint, &mut previous, input));
+        }
+
+        unsafe { wire_compat_diff_destroy(diffs) };
+
+        for (n, (c_line, rust_line)) in c_lines.iter().zip(rust_lines.iter()).enumerate() {
+            if c_line != rust_line {
+                panic!(
+                    "transcript differs at input {n}:\n  C   : {c_line}\n  rust: {rust_line}"
+                );
+            }
         }
     }
 }

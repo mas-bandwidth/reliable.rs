@@ -21,3 +21,130 @@ struct reliable_endpoint_t * wire_compat_endpoint_create( int fragment_above,
     config.process_packet_function = process;
     return reliable_endpoint_create( &config, 100.0 );
 }
+
+// ---------------------------------------------------------------
+// differential oracle
+//
+// runs a sequence of raw datagrams through one C endpoint with in-memory callbacks and
+// formats, per datagram, one line the port's differential test can compare byte for byte.
+// the eleven counters use the reliable.h order and names.
+
+#include <stdio.h>
+#include <stdlib.h>
+
+struct wire_compat_diff_t
+{
+    struct reliable_endpoint_t * endpoint;
+    int num_processed;
+    int last_sequence;
+    int last_bytes;
+    uint64_t previous_counters[RELIABLE_ENDPOINT_NUM_COUNTERS];
+};
+
+static const char * wire_compat_diff_counter_names[RELIABLE_ENDPOINT_NUM_COUNTERS] =
+{
+    "num_packets_sent",
+    "num_packets_received",
+    "num_packets_acked",
+    "num_packets_stale",
+    "num_packets_invalid",
+    "num_packets_too_large_to_send",
+    "num_packets_too_large_to_receive",
+    "num_fragments_sent",
+    "num_fragments_received",
+    "num_fragments_invalid",
+    "num_packets_duplicate"
+};
+
+static void wire_compat_diff_transmit( void * context, uint64_t id, uint16_t sequence, uint8_t * packet_data, int packet_bytes )
+{
+    (void) context; (void) id; (void) sequence; (void) packet_data; (void) packet_bytes;
+}
+
+static int wire_compat_diff_process( void * context, uint64_t id, uint16_t sequence, uint8_t * packet_data, int packet_bytes )
+{
+    (void) id; (void) packet_data; (void) packet_bytes;
+    struct wire_compat_diff_t * diff = (struct wire_compat_diff_t*) context;
+    diff->num_processed++;
+    diff->last_sequence = sequence;
+    diff->last_bytes = packet_bytes;
+    return 1;
+}
+
+void * wire_compat_diff_create( int fragment_above )
+{
+    struct wire_compat_diff_t * diff = (struct wire_compat_diff_t*) calloc( 1, sizeof( struct wire_compat_diff_t ) );
+    if ( !diff )
+        return NULL;
+    diff->endpoint = wire_compat_endpoint_create( fragment_above, 0, diff, wire_compat_diff_transmit, wire_compat_diff_process );
+    if ( !diff->endpoint )
+    {
+        free( diff );
+        return NULL;
+    }
+    return diff;
+}
+
+void wire_compat_diff_destroy( void * handle )
+{
+    struct wire_compat_diff_t * diff = (struct wire_compat_diff_t*) handle;
+    if ( !diff )
+        return;
+    reliable_endpoint_destroy( diff->endpoint );
+    free( diff );
+}
+
+// feeds one datagram and writes one transcript line. returns the number of bytes written,
+// excluding the terminator, or -1 if the output buffer is too small.
+
+int wire_compat_diff_feed( void * handle, const uint8_t * data, int len, int n, char * out, int cap )
+{
+    struct wire_compat_diff_t * diff = (struct wire_compat_diff_t*) handle;
+
+    const int processed_before = diff->num_processed;
+
+    reliable_endpoint_receive_packet( diff->endpoint, (uint8_t*) data, len );
+
+    const int delivered = diff->num_processed != processed_before;
+
+    RELIABLE_CONST uint64_t * counters = reliable_endpoint_counters( diff->endpoint );
+
+    const char * changed = "none";
+    for ( int i = 0; i < RELIABLE_ENDPOINT_NUM_COUNTERS; ++i )
+    {
+        if ( counters[i] != diff->previous_counters[i] )
+        {
+            changed = wire_compat_diff_counter_names[i];
+            break;
+        }
+    }
+    for ( int i = 0; i < RELIABLE_ENDPOINT_NUM_COUNTERS; ++i )
+        diff->previous_counters[i] = counters[i];
+
+    int written = snprintf( out, (size_t) cap,
+        "%d %s %s %s ",
+        n,
+        delivered ? "accepted" : "refused",
+        changed,
+        delivered ? "" : "-" );
+    if ( written < 0 || written >= cap )
+        return -1;
+
+    if ( delivered )
+    {
+        int more = snprintf( out + written, (size_t) ( cap - written ), "%d:%d ", diff->last_sequence, diff->last_bytes );
+        if ( more < 0 || more >= cap - written )
+            return -1;
+        written += more;
+    }
+
+    for ( int i = 0; i < RELIABLE_ENDPOINT_NUM_COUNTERS; ++i )
+    {
+        int more = snprintf( out + written, (size_t) ( cap - written ), "%llu%s", (unsigned long long) counters[i], i + 1 < RELIABLE_ENDPOINT_NUM_COUNTERS ? " " : "" );
+        if ( more < 0 || more >= cap - written )
+            return -1;
+        written += more;
+    }
+
+    return written;
+}

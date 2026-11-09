@@ -264,8 +264,9 @@ impl Endpoint {
     ///
     /// Panics if the config is invalid: zero sizes, a packet buffer size above `16384`,
     /// `max_fragments > 256`, `fragment_above > max_packet_size`, insufficient fragment
-    /// capacity, or a fragment capacity or `packet_header_size` that makes a packet
-    /// length overflow the `u32` the port carries lengths in.
+    /// capacity, a fragment capacity or `packet_header_size` that makes a packet length
+    /// overflow the `u32` the port carries lengths in, or a smoothing factor outside
+    /// `[0.0, 1.0]` (which includes `NaN`).
     pub fn new(config: Config, time: f64) -> Self {
         assert!(config.max_packet_size > 0);
         assert!(config.fragment_above > 0);
@@ -299,6 +300,18 @@ impl Endpoint {
         assert!(config.fragment_reassembly_buffer_size > 0);
         assert!(config.fragment_reassembly_buffer_size <= 16384);
         assert!(config.rtt_history_size > 0);
+        assert!(
+            (0.0..=1.0).contains(&config.rtt_smoothing_factor),
+            "rtt_smoothing_factor must be in [0.0, 1.0]"
+        );
+        assert!(
+            (0.0..=1.0).contains(&config.packet_loss_smoothing_factor),
+            "packet_loss_smoothing_factor must be in [0.0, 1.0]"
+        );
+        assert!(
+            (0.0..=1.0).contains(&config.bandwidth_smoothing_factor),
+            "bandwidth_smoothing_factor must be in [0.0, 1.0]"
+        );
 
         // C 1.4.3 (6055a51), reliable.c:644:
         //     if ( (int64_t) config->packet_header_size + (int64_t) config->max_packet_size > INT_MAX )
@@ -1243,6 +1256,114 @@ mod tests {
         assert_eq!(
             endpoint.config().max_fragments * endpoint.config().fragment_size,
             1000
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "rtt_smoothing_factor must be in [0.0, 1.0]")]
+    fn endpoint_rejects_rtt_smoothing_factor_below_range() {
+        Endpoint::new(
+            Config {
+                rtt_smoothing_factor: -0.1,
+                ..test_config("rtt-smoothing-below-range")
+            },
+            0.0,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "rtt_smoothing_factor must be in [0.0, 1.0]")]
+    fn endpoint_rejects_rtt_smoothing_factor_above_range() {
+        Endpoint::new(
+            Config {
+                rtt_smoothing_factor: 1.1,
+                ..test_config("rtt-smoothing-above-range")
+            },
+            0.0,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "rtt_smoothing_factor must be in [0.0, 1.0]")]
+    fn endpoint_rejects_rtt_smoothing_factor_nan() {
+        Endpoint::new(
+            Config {
+                rtt_smoothing_factor: f32::NAN,
+                ..test_config("rtt-smoothing-nan")
+            },
+            0.0,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "packet_loss_smoothing_factor must be in [0.0, 1.0]")]
+    fn endpoint_rejects_packet_loss_smoothing_factor_below_range() {
+        Endpoint::new(
+            Config {
+                packet_loss_smoothing_factor: -0.1,
+                ..test_config("packet-loss-smoothing-below-range")
+            },
+            0.0,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "packet_loss_smoothing_factor must be in [0.0, 1.0]")]
+    fn endpoint_rejects_packet_loss_smoothing_factor_above_range() {
+        Endpoint::new(
+            Config {
+                packet_loss_smoothing_factor: 1.1,
+                ..test_config("packet-loss-smoothing-above-range")
+            },
+            0.0,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "packet_loss_smoothing_factor must be in [0.0, 1.0]")]
+    fn endpoint_rejects_packet_loss_smoothing_factor_nan() {
+        Endpoint::new(
+            Config {
+                packet_loss_smoothing_factor: f32::NAN,
+                ..test_config("packet-loss-smoothing-nan")
+            },
+            0.0,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "bandwidth_smoothing_factor must be in [0.0, 1.0]")]
+    fn endpoint_rejects_bandwidth_smoothing_factor_below_range() {
+        Endpoint::new(
+            Config {
+                bandwidth_smoothing_factor: -0.1,
+                ..test_config("bandwidth-smoothing-below-range")
+            },
+            0.0,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "bandwidth_smoothing_factor must be in [0.0, 1.0]")]
+    fn endpoint_rejects_bandwidth_smoothing_factor_above_range() {
+        Endpoint::new(
+            Config {
+                bandwidth_smoothing_factor: 1.1,
+                ..test_config("bandwidth-smoothing-above-range")
+            },
+            0.0,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "bandwidth_smoothing_factor must be in [0.0, 1.0]")]
+    fn endpoint_rejects_bandwidth_smoothing_factor_nan() {
+        Endpoint::new(
+            Config {
+                bandwidth_smoothing_factor: f32::NAN,
+                ..test_config("bandwidth-smoothing-nan")
+            },
+            0.0,
         );
     }
 

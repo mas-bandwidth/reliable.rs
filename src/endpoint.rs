@@ -1068,7 +1068,7 @@ mod tests {
                 sent_packets_buffer_size: 16385,
                 ..test_config("oversized-sent-buffer")
             },
-            0.0,
+            1000.0,
         );
     }
 
@@ -1080,7 +1080,7 @@ mod tests {
                 sent_packets_buffer_size: 32768,
                 ..test_config("oversized-sent-buffer-half-range")
             },
-            0.0,
+            1000.0,
         );
     }
 
@@ -1092,7 +1092,7 @@ mod tests {
                 received_packets_buffer_size: 16385,
                 ..test_config("oversized-received-buffer")
             },
-            0.0,
+            1000.0,
         );
     }
 
@@ -1104,7 +1104,7 @@ mod tests {
                 received_packets_buffer_size: 32768,
                 ..test_config("oversized-received-buffer-half-range")
             },
-            0.0,
+            1000.0,
         );
     }
 
@@ -1116,7 +1116,7 @@ mod tests {
                 fragment_reassembly_buffer_size: 16385,
                 ..test_config("oversized-reassembly-buffer")
             },
-            0.0,
+            1000.0,
         );
     }
 
@@ -1128,7 +1128,7 @@ mod tests {
                 fragment_reassembly_buffer_size: 32768,
                 ..test_config("oversized-reassembly-buffer-half-range")
             },
-            0.0,
+            1000.0,
         );
     }
 
@@ -1141,8 +1141,8 @@ mod tests {
             ..test_config("maximum-buffers")
         };
 
-        let mut sender = Endpoint::new(config.clone(), 0.0);
-        let mut receiver = Endpoint::new(config, 0.0);
+        let mut sender = Endpoint::new(config.clone(), 1000.0);
+        let mut receiver = Endpoint::new(config, 1000.0);
 
         let packet = [0u8; 32];
         let mut received = Vec::new();

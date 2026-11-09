@@ -22,16 +22,34 @@ pub struct Config {
     pub fragment_above: usize,
     /// Maximum number of fragments per-packet. 256 max. Must be large enough to cover
     /// `max_packet_size` at `fragment_size` bytes per fragment.
+    ///
+    /// The receiver drops a fragment whose packet has more fragments than its own
+    /// `max_fragments`, so it must be at least the fragment count the other side sends.
     pub max_fragments: usize,
     /// Size of each fragment (bytes).
+    ///
+    /// Both sides must use the same value: the receiver drops a fragment larger than its
+    /// own `fragment_size`, and any fragment but the last that is not exactly that size.
     pub fragment_size: usize,
     /// Maximum number of acks buffered between calls to [`Endpoint::clear_acks`].
     pub ack_buffer_size: usize,
-    /// Number of sent packets tracked for acks, packet loss and bandwidth stats.
+    /// Number of sent packets tracked for acks, packet loss and bandwidth stats. Rounded
+    /// up to a power of two.
+    ///
+    /// Packet loss is sampled over the oldest `sent_packets_buffer_size / 2` entries, so
+    /// a value below 4 measures it over at most one packet, and a value of 1 never
+    /// measures it (it reads 0). Sent and acked bandwidth are sampled over the oldest
+    /// half of the rounded buffer and need two samples, so a value of 1 or 2 never
+    /// measures them (they read 0).
     pub sent_packets_buffer_size: usize,
-    /// Number of received packets tracked. Also the window for stale and duplicate packet rejection.
+    /// Number of received packets tracked. Also the window for stale and duplicate packet
+    /// rejection. Rounded up to a power of two.
+    ///
+    /// Received bandwidth is sampled over the oldest half of the rounded buffer and needs
+    /// two samples, so a value of 1 or 2 never measures it (it reads 0).
     pub received_packets_buffer_size: usize,
     /// Number of packets that can be under reassembly from fragments at the same time.
+    /// Rounded up to a power of two.
     pub fragment_reassembly_buffer_size: usize,
     /// Exponential smoothing factor for the rtt moving average.
     pub rtt_smoothing_factor: f32,
@@ -96,13 +114,24 @@ pub struct Counters {
 }
 
 /// Bandwidth statistics, in kilobits per-second.
+///
+/// Each figure is computed by [`Endpoint::update`] from the send or receive times of
+/// the packets in its window, not from the current time, so when traffic stops the
+/// figures settle on the rate of the last packets in the window rather than falling to
+/// zero.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Bandwidth {
-    /// Outgoing bandwidth over the sent packet window.
+    /// Outgoing bandwidth over the sent packet window. Each sent packet counts once as
+    /// [`Config::packet_header_size`] plus its payload, whether or not it was
+    /// fragmented; reliable's own packet and fragment headers are not counted.
     pub sent_kbps: f32,
-    /// Incoming bandwidth over the received packet window.
+    /// Incoming bandwidth over the received packet window. Each packet accepted by the
+    /// `process` closure counts as [`Config::packet_header_size`] plus the packet as
+    /// received, including reliable's packet header (for a fragmented packet, the
+    /// reassembled packet, without fragment headers). Rejected packets are not counted.
     pub received_kbps: f32,
-    /// Outgoing bandwidth restricted to packets that were acked.
+    /// Outgoing bandwidth restricted to packets that were acked, counted as for
+    /// `sent_kbps`.
     pub acked_kbps: f32,
 }
 
@@ -477,6 +506,10 @@ impl Endpoint {
     /// the `process` closure as `(sequence, packet_data)`; return true to accept and ack
     /// the packet, false to reject it (rejected packets are not acked and may be
     /// processed again if they arrive again). Stale and duplicate packets are dropped.
+    ///
+    /// The acks a packet carries for packets this endpoint sent are applied only when
+    /// `process` accepts it: the acks in a rejected packet are discarded, and are
+    /// reported only if a later accepted packet carries them again.
     pub fn receive_packet(
         &mut self,
         packet_data: &[u8],
@@ -969,7 +1002,8 @@ impl Endpoint {
         self.packet_loss
     }
 
-    /// Sent, received and acked bandwidth in kilobits per-second.
+    /// Sent, received and acked bandwidth in kilobits per-second. See [`Bandwidth`] for
+    /// what each figure counts.
     pub fn bandwidth(&self) -> Bandwidth {
         Bandwidth {
             sent_kbps: self.sent_bandwidth_kbps,
@@ -1429,6 +1463,65 @@ mod tests {
 
         assert_eq!(num_processed, NUM_ITERATIONS + 1);
         assert!(!receiver.fragment_reassembly.exists(fragmented_sequence));
+    }
+
+    #[test]
+    fn duplicate_packet_detected_across_sequence_wrap() {
+        let mut sender = Endpoint::new(test_config("sender"), 1000.0);
+        let mut receiver = Endpoint::new(
+            Config {
+                sent_packets_buffer_size: 255,
+                received_packets_buffer_size: 255,
+                ..test_config("receiver")
+            },
+            1000.0,
+        );
+
+        let dummy_packet = [0u8; 8];
+        let mut num_processed = 0;
+        let mut max_sequence_packet = Vec::new();
+
+        // send through the full sequence space, then wrap to zero
+
+        for _ in 0..=u16::MAX {
+            sender.send_packet(&dummy_packet, |sequence, data| {
+                if sequence == u16::MAX {
+                    max_sequence_packet = data.to_vec();
+                }
+                receiver.receive_packet(data, |_, _| {
+                    num_processed += 1;
+                    true
+                });
+            });
+        }
+
+        sender.send_packet(&dummy_packet, |_, data| {
+            receiver.receive_packet(data, |_, _| {
+                num_processed += 1;
+                true
+            });
+        });
+
+        assert_eq!(num_processed, u16::MAX as usize + 2);
+
+        // replaying the last packet after the wrap must not deliver it a second time
+
+        receiver.receive_packet(&max_sequence_packet, |_, _| {
+            num_processed += 1;
+            true
+        });
+
+        assert_eq!(num_processed, u16::MAX as usize + 2);
+        assert_eq!(receiver.counters().num_packets_duplicate, 1);
+        assert_eq!(receiver.counters().num_packets_stale, 0);
+
+        // the receiver still reports an ack for the last packet before the wrap
+
+        receiver.send_packet(&dummy_packet, |_, data| {
+            sender.receive_packet(data, |_, _| true);
+        });
+
+        assert!(sender.acks().contains(&u16::MAX));
     }
 
     #[test]
@@ -1924,6 +2017,160 @@ mod tests {
         assert_eq!(sender.jitter_max_vs_min_rtt(), 0.0);
         assert_eq!(sender.jitter_stddev_vs_avg_rtt(), 0.0);
     }
+
+    #[test]
+    fn rtt_history_statistics() {
+        let mut time = 100.0;
+
+        let mut sender = Endpoint::new(test_config("sender"), time);
+        let mut receiver = Endpoint::new(test_config("receiver"), time);
+
+        let packet = [0u8; 8];
+
+        // one sample per round trip delay, in milliseconds
+
+        let delays_ms: [f64; 4] = [10.0, 20.0, 30.0, 40.0];
+
+        for delay_ms in delays_ms {
+            sender.update(time);
+            receiver.update(time);
+
+            sender.send_packet(&packet, |_, data| {
+                receiver.receive_packet(data, |_, _| true);
+            });
+
+            time += delay_ms / 1000.0;
+
+            sender.update(time);
+            receiver.update(time);
+
+            receiver.send_packet(&packet, |_, data| {
+                sender.receive_packet(data, |_, _| true);
+            });
+
+            sender.update(time);
+
+            sender.clear_acks();
+            receiver.clear_acks();
+        }
+
+        // deltas from the 10ms minimum are 0, 10, 20 and 30ms, averaging 15ms with a
+        // 30ms maximum. against the 25ms mean, the squared deviations are 225, 25, 25
+        // and 225, whose mean square root is 11.18ms.
+
+        assert!((sender.rtt_min() - 10.0).abs() < 0.01);
+        assert!((sender.rtt_max() - 40.0).abs() < 0.01);
+        assert!((sender.rtt_avg() - 25.0).abs() < 0.01);
+        assert!((sender.jitter_avg_vs_min_rtt() - 15.0).abs() < 0.01);
+        assert!((sender.jitter_max_vs_min_rtt() - 30.0).abs() < 0.01);
+        assert!((sender.jitter_stddev_vs_avg_rtt() - 11.180_34).abs() < 0.01);
+    }
+
+    #[test]
+    fn packet_loss_statistic() {
+        let mut time = 100.0;
+
+        let mut sender = Endpoint::new(test_config("sender"), time);
+        let mut receiver = Endpoint::new(test_config("receiver"), time);
+
+        let packet = [0u8; 64];
+        let ack_packet = [0u8; 4];
+
+        // drop every second packet, in both directions
+
+        for sequence in 0..400u16 {
+            let deliver = sequence % 2 == 0;
+
+            sender.send_packet(&packet, |_, data| {
+                if deliver {
+                    receiver.receive_packet(data, |_, _| true);
+                }
+            });
+
+            receiver.send_packet(&ack_packet, |_, data| {
+                if deliver {
+                    sender.receive_packet(data, |_, _| true);
+                }
+            });
+
+            time += 0.01;
+
+            sender.update(time);
+            receiver.update(time);
+
+            sender.clear_acks();
+            receiver.clear_acks();
+        }
+
+        // the oldest half of the sent packet window holds an even mix of acked and
+        // dropped packets, so the smoothed loss has settled at fifty percent
+
+        assert!((sender.packet_loss() - 50.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn bandwidth_statistics() {
+        let mut config = test_config("sender");
+        config.sent_packets_buffer_size = 64;
+        config.received_packets_buffer_size = 64;
+        config.bandwidth_smoothing_factor = 1.0;
+
+        let mut time = 100.0;
+
+        let mut sender = Endpoint::new(config.clone(), time);
+        let mut receiver = Endpoint::new(test_config("receiver"), time);
+
+        let payload = [0u8; 100];
+        let ack_payload = [0u8; 100];
+
+        // one packet each way every 10ms. the four byte header carries the two byte
+        // sequence, a one byte ack offset and no ack bits, since every packet is
+        // received.
+
+        let delta_time = 0.01;
+        let num_packets = 200usize;
+
+        for _ in 0..num_packets {
+            time += delta_time;
+
+            sender.update(time);
+            receiver.update(time);
+
+            sender.send_packet(&payload, |_, data| {
+                receiver.receive_packet(data, |_, _| true);
+            });
+
+            receiver.send_packet(&ack_payload, |_, data| {
+                sender.receive_packet(data, |_, _| true);
+            });
+
+            sender.update(time);
+            receiver.update(time);
+
+            sender.clear_acks();
+            receiver.clear_acks();
+        }
+
+        // the window is the oldest half of the 64 entry buffers: 32 packets spanning
+        // 31 intervals. sent and acked bytes include the configured header overhead;
+        // received bytes also include the wire header on the arriving packet.
+
+        let window_packets = 32.0_f64;
+        let window_seconds = 31.0 * delta_time;
+        let header_bytes = config.packet_header_size as f64;
+        let sent_bytes = window_packets * (header_bytes + payload.len() as f64);
+        let received_bytes = window_packets * (header_bytes + 4.0 + ack_payload.len() as f64);
+
+        let expected_sent = (sent_bytes * 8.0 / 1000.0 / window_seconds) as f32;
+        let expected_received = (received_bytes * 8.0 / 1000.0 / window_seconds) as f32;
+
+        let bandwidth = sender.bandwidth();
+
+        assert!((bandwidth.sent_kbps - expected_sent).abs() < 0.01);
+        assert!((bandwidth.received_kbps - expected_received).abs() < 0.01);
+        assert!((bandwidth.acked_kbps - expected_sent).abs() < 0.01);
+    }
+
     // the sequence number crosses 65535 -> 0
 
     #[test]

@@ -4,6 +4,9 @@ use crate::{sequence_greater_than, sequence_less_than};
 /// structure used to track sent packets, received packets and packets under reassembly.
 /// (Where the C library marks empty slots with a 0xFFFFFFFF sentinel in a u32 array,
 /// this port stores `Option<u16>` — the same four bytes per slot, without the sentinel.)
+///
+/// The capacity is rounded up to a power of two, so each slot corresponds to the same
+/// sequence number on every pass through the sequence space.
 pub(crate) struct SequenceBuffer<T> {
     sequence: u16,
     entry_sequence: Vec<Option<u16>>,
@@ -13,6 +16,7 @@ pub(crate) struct SequenceBuffer<T> {
 impl<T: Default> SequenceBuffer<T> {
     pub fn new(num_entries: usize) -> Self {
         assert!(num_entries > 0);
+        let num_entries = num_entries.next_power_of_two();
         Self {
             sequence: 0,
             entry_sequence: vec![None; num_entries],
@@ -29,6 +33,16 @@ impl<T: Default> SequenceBuffer<T> {
 
     pub fn num_entries(&self) -> usize {
         self.entries.len()
+    }
+
+    fn is_stale(&self, sequence: u16) -> bool {
+        // a buffer covering the whole sequence space holds every sequence number, so
+        // nothing is stale (its capacity does not fit the u16 used for the window)
+        self.entries.len() < 65536
+            && sequence_less_than(
+                sequence,
+                self.sequence.wrapping_sub(self.entries.len() as u16),
+            )
     }
 
     pub fn reset(&mut self) {
@@ -61,20 +75,14 @@ impl<T: Default> SequenceBuffer<T> {
 
     /// Returns false if the sequence number is too old to be inserted (stale).
     pub fn can_insert(&self, sequence: u16) -> bool {
-        !sequence_less_than(
-            sequence,
-            self.sequence.wrapping_sub(self.entries.len() as u16),
-        )
+        !self.is_stale(sequence)
     }
 
     /// Inserts an entry, advancing the buffer if the sequence number is newer than the
     /// most recent. Returns None if the sequence number is stale. The returned entry is
     /// reset to its default value.
     pub fn insert(&mut self, sequence: u16) -> Option<&mut T> {
-        if sequence_less_than(
-            sequence,
-            self.sequence.wrapping_sub(self.entries.len() as u16),
-        ) {
+        if self.is_stale(sequence) {
             return None;
         }
         if sequence_greater_than(sequence.wrapping_add(1), self.sequence) {
@@ -96,10 +104,7 @@ impl<T: Default> SequenceBuffer<T> {
         if sequence_greater_than(sequence.wrapping_add(1), self.sequence) {
             self.remove_entries(self.sequence, sequence);
             self.sequence = sequence.wrapping_add(1);
-        } else if sequence_less_than(
-            sequence,
-            self.sequence.wrapping_sub(self.entries.len() as u16),
-        ) {
+        } else if self.is_stale(sequence) {
             return None;
         }
         let index = sequence as usize % self.entries.len();
@@ -216,6 +221,56 @@ mod tests {
         for i in 0..TEST_SEQUENCE_BUFFER_SIZE {
             assert!(sequence_buffer.find(i as u16).is_none());
         }
+    }
+
+    #[test]
+    fn sequence_buffer_rounds_capacity_to_power_of_two() {
+        let sequence_buffer = SequenceBuffer::<TestSequenceData>::new(255);
+        assert_eq!(sequence_buffer.num_entries(), 256);
+    }
+
+    #[test]
+    fn sequence_buffer_supports_full_sequence_space() {
+        let mut sequence_buffer = SequenceBuffer::<TestSequenceData>::new(65535);
+        assert_eq!(sequence_buffer.num_entries(), 65536);
+
+        sequence_buffer.insert(u16::MAX).expect("insert");
+        sequence_buffer.insert(0).expect("insert");
+
+        assert!(sequence_buffer.exists(u16::MAX));
+        assert!(sequence_buffer.exists(0));
+    }
+
+    #[test]
+    fn sequence_buffer_retains_recent_entry_across_wrap() {
+        let mut sequence_buffer = SequenceBuffer::<TestSequenceData>::new(255);
+
+        sequence_buffer.insert(u16::MAX).expect("insert");
+        sequence_buffer.insert(0).expect("insert");
+
+        assert!(sequence_buffer.exists(u16::MAX));
+        assert!(sequence_buffer.exists(0));
+
+        let (ack, ack_bits) = sequence_buffer.generate_ack_bits();
+        assert_eq!(ack, 0);
+        assert_eq!(ack_bits & 0b11, 0b11);
+    }
+
+    #[test]
+    fn sequence_buffer_insert_advance_first_retains_entry_across_wrap() {
+        let mut sequence_buffer = SequenceBuffer::<TestSequenceData>::new(255);
+
+        sequence_buffer
+            .insert_advance_first(u16::MAX)
+            .expect("insert");
+        sequence_buffer.insert_advance_first(0).expect("insert");
+
+        assert!(sequence_buffer.exists(u16::MAX));
+        assert!(sequence_buffer.exists(0));
+
+        let (ack, ack_bits) = sequence_buffer.generate_ack_bits();
+        assert_eq!(ack, 0);
+        assert_eq!(ack_bits & 0b11, 0b11);
     }
 
     #[test]

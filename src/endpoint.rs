@@ -1728,6 +1728,37 @@ mod tests {
     }
 
     #[test]
+    fn rejected_fragment_does_not_count_as_received() {
+        let mut receiver = Endpoint::new(test_config("receiver"), 100.0);
+
+        let sequence = 0;
+        let fragment_id = 1;
+        let num_fragments = 2;
+        let reassembly_data = receiver
+            .fragment_reassembly
+            .insert_advance_first(sequence)
+            .expect("reassembly data");
+        reassembly_data.num_fragments_total = num_fragments;
+        reassembly_data.packet_data = vec![0; MAX_PACKET_HEADER_BYTES];
+
+        let fragment_size = receiver.config().fragment_size;
+        let mut packet = vec![0u8; FRAGMENT_HEADER_BYTES + fragment_size];
+        packet[0] = 1;
+        packet[1..3].copy_from_slice(&sequence.to_le_bytes());
+        packet[3] = fragment_id as u8;
+        packet[4] = (num_fragments - 1) as u8;
+
+        receiver.receive_packet(&packet, |_, _| true);
+
+        let reassembly_data = receiver
+            .fragment_reassembly
+            .find(sequence)
+            .expect("reassembly data");
+        assert_eq!(reassembly_data.num_fragments_received, 0);
+        assert!(!reassembly_data.fragment_received[fragment_id]);
+    }
+
+    #[test]
     fn fragment_cleanup() {
         let mut time = 100.0;
 

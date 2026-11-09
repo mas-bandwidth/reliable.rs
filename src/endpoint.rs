@@ -22,16 +22,31 @@ pub struct Config {
     pub fragment_above: usize,
     /// Maximum number of fragments per-packet. 256 max. Must be large enough to cover
     /// `max_packet_size` at `fragment_size` bytes per fragment.
+    ///
+    /// The receiver drops a fragment whose packet has more fragments than its own
+    /// `max_fragments`, so it must be at least the fragment count the other side sends.
     pub max_fragments: usize,
     /// Size of each fragment (bytes).
+    ///
+    /// Both sides must use the same value: the receiver drops a fragment larger than its
+    /// own `fragment_size`, and any fragment but the last that is not exactly that size.
     pub fragment_size: usize,
     /// Maximum number of acks buffered between calls to [`Endpoint::clear_acks`].
     pub ack_buffer_size: usize,
     /// Number of sent packets tracked for acks, packet loss and bandwidth stats. Rounded
     /// up to a power of two.
+    ///
+    /// Packet loss is sampled over the oldest `sent_packets_buffer_size / 2` entries, so
+    /// a value below 4 measures it over at most one packet, and a value of 1 never
+    /// measures it (it reads 0). Sent and acked bandwidth are sampled over the oldest
+    /// half of the rounded buffer and need two samples, so a value of 1 or 2 never
+    /// measures them (they read 0).
     pub sent_packets_buffer_size: usize,
     /// Number of received packets tracked. Also the window for stale and duplicate packet
     /// rejection. Rounded up to a power of two.
+    ///
+    /// Received bandwidth is sampled over the oldest half of the rounded buffer and needs
+    /// two samples, so a value of 1 or 2 never measures it (it reads 0).
     pub received_packets_buffer_size: usize,
     /// Number of packets that can be under reassembly from fragments at the same time.
     /// Rounded up to a power of two.
@@ -99,13 +114,24 @@ pub struct Counters {
 }
 
 /// Bandwidth statistics, in kilobits per-second.
+///
+/// Each figure is computed by [`Endpoint::update`] from the send or receive times of
+/// the packets in its window, not from the current time, so when traffic stops the
+/// figures settle on the rate of the last packets in the window rather than falling to
+/// zero.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Bandwidth {
-    /// Outgoing bandwidth over the sent packet window.
+    /// Outgoing bandwidth over the sent packet window. Each sent packet counts once as
+    /// [`Config::packet_header_size`] plus its payload, whether or not it was
+    /// fragmented; reliable's own packet and fragment headers are not counted.
     pub sent_kbps: f32,
-    /// Incoming bandwidth over the received packet window.
+    /// Incoming bandwidth over the received packet window. Each packet accepted by the
+    /// `process` closure counts as [`Config::packet_header_size`] plus the packet as
+    /// received, including reliable's packet header (for a fragmented packet, the
+    /// reassembled packet, without fragment headers). Rejected packets are not counted.
     pub received_kbps: f32,
-    /// Outgoing bandwidth restricted to packets that were acked.
+    /// Outgoing bandwidth restricted to packets that were acked, counted as for
+    /// `sent_kbps`.
     pub acked_kbps: f32,
 }
 
@@ -480,6 +506,10 @@ impl Endpoint {
     /// the `process` closure as `(sequence, packet_data)`; return true to accept and ack
     /// the packet, false to reject it (rejected packets are not acked and may be
     /// processed again if they arrive again). Stale and duplicate packets are dropped.
+    ///
+    /// The acks a packet carries for packets this endpoint sent are applied only when
+    /// `process` accepts it: the acks in a rejected packet are discarded, and are
+    /// reported only if a later accepted packet carries them again.
     pub fn receive_packet(
         &mut self,
         packet_data: &[u8],
@@ -972,7 +1002,8 @@ impl Endpoint {
         self.packet_loss
     }
 
-    /// Sent, received and acked bandwidth in kilobits per-second.
+    /// Sent, received and acked bandwidth in kilobits per-second. See [`Bandwidth`] for
+    /// what each figure counts.
     pub fn bandwidth(&self) -> Bandwidth {
         Bandwidth {
             sent_kbps: self.sent_bandwidth_kbps,

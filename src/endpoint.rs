@@ -27,11 +27,14 @@ pub struct Config {
     pub fragment_size: usize,
     /// Maximum number of acks buffered between calls to [`Endpoint::clear_acks`].
     pub ack_buffer_size: usize,
-    /// Number of sent packets tracked for acks, packet loss and bandwidth stats.
+    /// Number of sent packets tracked for acks, packet loss and bandwidth stats. Rounded
+    /// up to a power of two.
     pub sent_packets_buffer_size: usize,
-    /// Number of received packets tracked. Also the window for stale and duplicate packet rejection.
+    /// Number of received packets tracked. Also the window for stale and duplicate packet
+    /// rejection. Rounded up to a power of two.
     pub received_packets_buffer_size: usize,
     /// Number of packets that can be under reassembly from fragments at the same time.
+    /// Rounded up to a power of two.
     pub fragment_reassembly_buffer_size: usize,
     /// Exponential smoothing factor for the rtt moving average.
     pub rtt_smoothing_factor: f32,
@@ -1429,6 +1432,65 @@ mod tests {
 
         assert_eq!(num_processed, NUM_ITERATIONS + 1);
         assert!(!receiver.fragment_reassembly.exists(fragmented_sequence));
+    }
+
+    #[test]
+    fn duplicate_packet_detected_across_sequence_wrap() {
+        let mut sender = Endpoint::new(test_config("sender"), 1000.0);
+        let mut receiver = Endpoint::new(
+            Config {
+                sent_packets_buffer_size: 255,
+                received_packets_buffer_size: 255,
+                ..test_config("receiver")
+            },
+            1000.0,
+        );
+
+        let dummy_packet = [0u8; 8];
+        let mut num_processed = 0;
+        let mut max_sequence_packet = Vec::new();
+
+        // send through the full sequence space, then wrap to zero
+
+        for _ in 0..=u16::MAX {
+            sender.send_packet(&dummy_packet, |sequence, data| {
+                if sequence == u16::MAX {
+                    max_sequence_packet = data.to_vec();
+                }
+                receiver.receive_packet(data, |_, _| {
+                    num_processed += 1;
+                    true
+                });
+            });
+        }
+
+        sender.send_packet(&dummy_packet, |_, data| {
+            receiver.receive_packet(data, |_, _| {
+                num_processed += 1;
+                true
+            });
+        });
+
+        assert_eq!(num_processed, u16::MAX as usize + 2);
+
+        // replaying the last packet after the wrap must not deliver it a second time
+
+        receiver.receive_packet(&max_sequence_packet, |_, _| {
+            num_processed += 1;
+            true
+        });
+
+        assert_eq!(num_processed, u16::MAX as usize + 2);
+        assert_eq!(receiver.counters().num_packets_duplicate, 1);
+        assert_eq!(receiver.counters().num_packets_stale, 0);
+
+        // the receiver still reports an ack for the last packet before the wrap
+
+        receiver.send_packet(&dummy_packet, |_, data| {
+            sender.receive_packet(data, |_, _| true);
+        });
+
+        assert!(sender.acks().contains(&u16::MAX));
     }
 
     #[test]

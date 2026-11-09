@@ -1916,4 +1916,157 @@ mod tests {
         assert_eq!(sender.jitter_max_vs_min_rtt(), 0.0);
         assert_eq!(sender.jitter_stddev_vs_avg_rtt(), 0.0);
     }
+
+    #[test]
+    fn rtt_history_statistics() {
+        let mut time = 100.0;
+
+        let mut sender = Endpoint::new(test_config("sender"), time);
+        let mut receiver = Endpoint::new(test_config("receiver"), time);
+
+        let packet = [0u8; 8];
+
+        // one sample per round trip delay, in milliseconds
+
+        let delays_ms: [f64; 4] = [10.0, 20.0, 30.0, 40.0];
+
+        for delay_ms in delays_ms {
+            sender.update(time);
+            receiver.update(time);
+
+            sender.send_packet(&packet, |_, data| {
+                receiver.receive_packet(data, |_, _| true);
+            });
+
+            time += delay_ms / 1000.0;
+
+            sender.update(time);
+            receiver.update(time);
+
+            receiver.send_packet(&packet, |_, data| {
+                sender.receive_packet(data, |_, _| true);
+            });
+
+            sender.update(time);
+
+            sender.clear_acks();
+            receiver.clear_acks();
+        }
+
+        // deltas from the 10ms minimum are 0, 10, 20 and 30ms, averaging 15ms with a
+        // 30ms maximum. against the 25ms mean, the squared deviations are 225, 25, 25
+        // and 225, whose mean square root is 11.18ms.
+
+        assert!((sender.rtt_min() - 10.0).abs() < 0.01);
+        assert!((sender.rtt_max() - 40.0).abs() < 0.01);
+        assert!((sender.rtt_avg() - 25.0).abs() < 0.01);
+        assert!((sender.jitter_avg_vs_min_rtt() - 15.0).abs() < 0.01);
+        assert!((sender.jitter_max_vs_min_rtt() - 30.0).abs() < 0.01);
+        assert!((sender.jitter_stddev_vs_avg_rtt() - 11.180_34).abs() < 0.01);
+    }
+
+    #[test]
+    fn packet_loss_statistic() {
+        let mut time = 100.0;
+
+        let mut sender = Endpoint::new(test_config("sender"), time);
+        let mut receiver = Endpoint::new(test_config("receiver"), time);
+
+        let packet = [0u8; 64];
+        let ack_packet = [0u8; 4];
+
+        // drop every second packet, in both directions
+
+        for sequence in 0..400u16 {
+            let deliver = sequence % 2 == 0;
+
+            sender.send_packet(&packet, |_, data| {
+                if deliver {
+                    receiver.receive_packet(data, |_, _| true);
+                }
+            });
+
+            receiver.send_packet(&ack_packet, |_, data| {
+                if deliver {
+                    sender.receive_packet(data, |_, _| true);
+                }
+            });
+
+            time += 0.01;
+
+            sender.update(time);
+            receiver.update(time);
+
+            sender.clear_acks();
+            receiver.clear_acks();
+        }
+
+        // the oldest half of the sent packet window holds an even mix of acked and
+        // dropped packets, so the smoothed loss has settled at fifty percent
+
+        assert!((sender.packet_loss() - 50.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn bandwidth_statistics() {
+        let mut config = test_config("sender");
+        config.sent_packets_buffer_size = 64;
+        config.received_packets_buffer_size = 64;
+        config.bandwidth_smoothing_factor = 1.0;
+
+        let mut time = 100.0;
+
+        let mut sender = Endpoint::new(config.clone(), time);
+        let mut receiver = Endpoint::new(test_config("receiver"), time);
+
+        let payload = [0u8; 100];
+        let ack_payload = [0u8; 100];
+
+        // one packet each way every 10ms. the four byte header carries the two byte
+        // sequence, a one byte ack offset and no ack bits, since every packet is
+        // received.
+
+        let delta_time = 0.01;
+        let num_packets = 200usize;
+
+        for _ in 0..num_packets {
+            time += delta_time;
+
+            sender.update(time);
+            receiver.update(time);
+
+            sender.send_packet(&payload, |_, data| {
+                receiver.receive_packet(data, |_, _| true);
+            });
+
+            receiver.send_packet(&ack_payload, |_, data| {
+                sender.receive_packet(data, |_, _| true);
+            });
+
+            sender.update(time);
+            receiver.update(time);
+
+            sender.clear_acks();
+            receiver.clear_acks();
+        }
+
+        // the window is the oldest half of the 64 entry buffers: 32 packets spanning
+        // 31 intervals. sent and acked bytes include the configured header overhead;
+        // received bytes also include the wire header on the arriving packet.
+
+        let window_packets = 32.0_f64;
+        let window_seconds = 31.0 * delta_time;
+        let header_bytes = config.packet_header_size as f64;
+        let sent_bytes = window_packets * (header_bytes + payload.len() as f64);
+        let received_bytes = window_packets * (header_bytes + 4.0 + ack_payload.len() as f64);
+
+        let expected_sent = (sent_bytes * 8.0 / 1000.0 / window_seconds) as f32;
+        let expected_received = (received_bytes * 8.0 / 1000.0 / window_seconds) as f32;
+
+        let bandwidth = sender.bandwidth();
+
+        assert!((bandwidth.sent_kbps - expected_sent).abs() < 0.01);
+        assert!((bandwidth.received_kbps - expected_received).abs() < 0.01);
+        assert!((bandwidth.acked_kbps - expected_sent).abs() < 0.01);
+    }
 }

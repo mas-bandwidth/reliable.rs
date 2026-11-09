@@ -26,7 +26,7 @@ drifts from upstream.
 ### Carried into the port
 
 - **A configuration that cannot fit a packet is refused at endpoint create** (C 1.4.3;
-  reliable.rs#20, PR #22, reported as security#41). `Endpoint::new` rejects
+  reliable.rs#20, PR #22). `Endpoint::new` rejects
   `fragment_above > max_packet_size`, and a fragment capacity too small to carry a
   maximum-sized packet, using a division rather than a product that could overflow.
   Such a configuration used to be accepted and then fail on the first large packet.
@@ -151,7 +151,7 @@ drifts from upstream.
   every log that prints the name prints exactly its bytes. There is nothing to run off
   the end of.
 
-Publishing to crates.io is done by hand from Glenn's account.
+Publishing to crates.io is done by hand by the crate owner.
 
 ## 1.3.4 (2026-07-12)
 

@@ -2170,4 +2170,267 @@ mod tests {
         assert!((bandwidth.received_kbps - expected_received).abs() < 0.01);
         assert!((bandwidth.acked_kbps - expected_sent).abs() < 0.01);
     }
+
+    // the sequence number crosses 65535 -> 0
+
+    #[test]
+    fn test_sequence_wrap() {
+        let time = 100.0;
+
+        let mut sender = Endpoint::new(test_config("sender"), time);
+        let mut receiver = Endpoint::new(test_config("receiver"), time);
+
+        let num_iterations: usize = 65536 + 64;
+        let mut acked = [false; 65536];
+        let dummy_packet = [0u8; 8];
+
+        for _ in 0..num_iterations {
+            sender.send_packet(&dummy_packet, |_, data| {
+                receiver.receive_packet(data, |_, _| true);
+            });
+            receiver.send_packet(&dummy_packet, |_, data| {
+                sender.receive_packet(data, |_, _| true);
+            });
+
+            for &ack in sender.acks() {
+                acked[ack as usize] = true;
+            }
+
+            sender.clear_acks();
+            receiver.clear_acks();
+        }
+
+        assert_eq!(sender.next_packet_sequence(), num_iterations as u16);
+
+        // the sequences either side of the wrap were acked like any others
+
+        assert!(acked[65533]);
+        assert!(acked[65534]);
+        assert!(acked[65535]);
+        assert!(acked[0]);
+        assert!(acked[1]);
+        assert!(acked[2]);
+
+        for i in 0..65536 {
+            assert!(acked[i]);
+        }
+
+        assert_eq!(
+            receiver.counters().num_packets_received,
+            num_iterations as u64
+        );
+    }
+
+    // fragment counts at both ends of the range, and a payload that is an exact
+    // multiple of the fragment size
+
+    fn test_fragment_case(
+        fragment_size: usize,
+        max_fragments: usize,
+        packet_bytes: usize,
+        expected_fragments: usize,
+    ) {
+        let mut num_processed = 0;
+        let mut processed: Vec<u8> = Vec::new();
+
+        let config = |name: &str| Config {
+            fragment_size,
+            max_fragments,
+            max_packet_size: fragment_size * max_fragments,
+            fragment_above: fragment_size,
+            ..test_config(name)
+        };
+
+        let mut sender = Endpoint::new(config("sender"), 100.0);
+        let mut receiver = Endpoint::new(config("receiver"), 100.0);
+
+        let packet: Vec<u8> = (0..packet_bytes).map(|i| ((i * 31) + 7) as u8).collect();
+
+        sender.send_packet(&packet, |_, data| {
+            receiver.receive_packet(data, |_, data| {
+                num_processed += 1;
+                processed = data.to_vec();
+                true
+            });
+        });
+
+        assert_eq!(num_processed, 1);
+        assert_eq!(processed.len(), packet_bytes);
+        assert_eq!(processed, packet);
+
+        let fragments_sent = sender.counters().num_fragments_sent;
+        let fragments_received = receiver.counters().num_fragments_received;
+
+        if expected_fragments == 0 {
+            // below the threshold: sent whole, no fragments at all
+            assert_eq!(fragments_sent, 0);
+            assert_eq!(fragments_received, 0);
+        } else {
+            assert_eq!(fragments_sent, expected_fragments as u64);
+            assert_eq!(fragments_received, expected_fragments as u64);
+        }
+    }
+
+    #[test]
+    fn test_fragment_counts() {
+        // an exact multiple of the fragment size, where the last fragment is full rather
+        // than a remainder
+        test_fragment_case(512, 16, 512 * 4, 4);
+
+        // the largest packet the config allows, again an exact multiple
+        test_fragment_case(512, 16, 512 * 16, 16);
+
+        // one fragment: above the threshold by a single byte
+        test_fragment_case(512, 16, 513, 2);
+        test_fragment_case(64, 256, 65, 2);
+
+        // 256 fragments, the maximum the wire format can express
+        test_fragment_case(64, 256, 64 * 256, 256);
+        test_fragment_case(64, 256, 64 * 255 + 1, 256);
+
+        // at or below the threshold the packet is not fragmented
+        test_fragment_case(512, 16, 512, 0);
+        test_fragment_case(512, 16, 1, 0);
+    }
+
+    // truncated packets and fragments are rejected rather than acted on
+
+    #[test]
+    fn test_truncated_packets() {
+        let mut num_processed = 0;
+        let mut captured: Vec<Vec<u8>> = Vec::new();
+
+        let config = |name: &str| Config {
+            fragment_size: 256,
+            max_fragments: 16,
+            max_packet_size: 256 * 16,
+            fragment_above: 256,
+            ..test_config(name)
+        };
+
+        let mut sender = Endpoint::new(config("sender"), 100.0);
+        let mut receiver = Endpoint::new(config("receiver"), 100.0);
+
+        // an unfragmented packet, captured on the wire
+
+        let packet = [0xABu8; 200];
+        sender.send_packet(&packet, |_, data| captured.push(data.to_vec()));
+        assert_eq!(captured.len(), 1);
+
+        let whole_bytes = captured[0].len();
+
+        // every truncation of it shorter than the header is rejected, and none is processed
+
+        for truncated_bytes in 1..4 {
+            receiver.receive_packet(&captured[0][..truncated_bytes], |_, _| {
+                num_processed += 1;
+                true
+            });
+        }
+
+        assert_eq!(receiver.counters().num_packets_invalid, 3);
+        assert_eq!(num_processed, 0);
+
+        // the whole packet still arrives
+
+        receiver.receive_packet(&captured[0][..whole_bytes], |_, _| {
+            num_processed += 1;
+            true
+        });
+        assert_eq!(num_processed, 1);
+
+        // now a fragmented packet
+
+        captured.clear();
+
+        let large_packet = [0xCDu8; 1024];
+        sender.send_packet(&large_packet, |_, data| captured.push(data.to_vec()));
+        assert_eq!(captured.len(), 4);
+
+        // a fragment truncated inside its header is rejected
+
+        for truncated_bytes in 1..FRAGMENT_HEADER_BYTES {
+            receiver.receive_packet(&captured[1][..truncated_bytes], |_, _| {
+                num_processed += 1;
+                true
+            });
+        }
+
+        assert_eq!(receiver.counters().num_fragments_received, 0);
+        assert_eq!(
+            receiver.counters().num_fragments_invalid,
+            (FRAGMENT_HEADER_BYTES - 1) as u64
+        );
+
+        // a fragment that is not the last one must carry exactly fragment_size bytes, so
+        // a truncated body is rejected too
+
+        let fragment_one_bytes = captured[1].len();
+        receiver.receive_packet(&captured[1][..fragment_one_bytes - 1], |_, _| {
+            num_processed += 1;
+            true
+        });
+        assert_eq!(receiver.counters().num_fragments_received, 0);
+        assert_eq!(
+            receiver.counters().num_fragments_invalid,
+            FRAGMENT_HEADER_BYTES as u64
+        );
+        assert_eq!(num_processed, 1);
+
+        // the intact fragments reassemble
+
+        for fragment in &captured {
+            receiver.receive_packet(fragment, |_, _| {
+                num_processed += 1;
+                true
+            });
+        }
+
+        assert_eq!(receiver.counters().num_fragments_received, 4);
+        assert_eq!(num_processed, 2);
+    }
+
+    #[test]
+    fn test_rtt() {
+        let mut time = 100.0;
+        let delta_time = 0.01;
+
+        let mut sender = Endpoint::new(test_config("sender"), time);
+        let mut receiver = Endpoint::new(test_config("receiver"), time);
+
+        let dummy_packet = [0u8; 8];
+
+        // step time between the send and the reply so each acknowledgment carries a real
+        // round trip rather than a zero sample
+
+        for _ in 0..1000 {
+            sender.send_packet(&dummy_packet, |_, data| {
+                receiver.receive_packet(data, |_, _| true);
+            });
+
+            time += delta_time;
+            sender.update(time);
+            receiver.update(time);
+
+            receiver.send_packet(&dummy_packet, |_, data| {
+                sender.receive_packet(data, |_, _| true);
+            });
+
+            time += delta_time;
+            sender.update(time);
+            receiver.update(time);
+
+            sender.clear_acks();
+            receiver.clear_acks();
+        }
+
+        let rtt = sender.rtt();
+        let rtt_min = sender.rtt_min();
+        let rtt_max = sender.rtt_max();
+        let rtt_avg = sender.rtt_avg();
+
+        assert!(rtt.is_finite() && rtt > 0.0);
+        assert!(rtt_min >= 0.0 && rtt_min <= rtt_avg && rtt_avg <= rtt_max);
+        assert!(rtt_max < 1000.0); // rtt is in milliseconds
+    }
 }

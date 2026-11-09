@@ -259,10 +259,10 @@ impl Endpoint {
     ///
     /// # Panics
     ///
-    /// Panics if the config is invalid: zero sizes, `max_fragments > 256`,
-    /// `fragment_above > max_packet_size`, insufficient fragment capacity, or a
-    /// fragment capacity or `packet_header_size` that makes a packet length overflow
-    /// the `u32` the port carries lengths in.
+    /// Panics if the config is invalid: zero sizes, a packet buffer size above `16384`,
+    /// `max_fragments > 256`, `fragment_above > max_packet_size`, insufficient fragment
+    /// capacity, or a fragment capacity or `packet_header_size` that makes a packet
+    /// length overflow the `u32` the port carries lengths in.
     pub fn new(config: Config, time: f64) -> Self {
         assert!(config.max_packet_size > 0);
         assert!(config.fragment_above > 0);
@@ -288,9 +288,13 @@ impl Endpoint {
             "max_fragments * fragment_size must fit a u32 packet length"
         );
         assert!(config.ack_buffer_size > 0);
+        // C reference (rel-buf-size-cap): the packet buffers are capped at 16384 entries
         assert!(config.sent_packets_buffer_size > 0);
+        assert!(config.sent_packets_buffer_size <= 16384);
         assert!(config.received_packets_buffer_size > 0);
+        assert!(config.received_packets_buffer_size <= 16384);
         assert!(config.fragment_reassembly_buffer_size > 0);
+        assert!(config.fragment_reassembly_buffer_size <= 16384);
         assert!(config.rtt_history_size > 0);
 
         // C 1.4.3 (6055a51), reliable.c:644:
@@ -1054,6 +1058,106 @@ mod tests {
             },
             0.0,
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "config.sent_packets_buffer_size <= 16384")]
+    fn endpoint_rejects_sent_packets_buffer_size_above_maximum() {
+        Endpoint::new(
+            Config {
+                sent_packets_buffer_size: 16385,
+                ..test_config("oversized-sent-buffer")
+            },
+            0.0,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "config.sent_packets_buffer_size <= 16384")]
+    fn endpoint_rejects_sent_packets_buffer_size_above_half_range() {
+        Endpoint::new(
+            Config {
+                sent_packets_buffer_size: 32768,
+                ..test_config("oversized-sent-buffer-half-range")
+            },
+            0.0,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "config.received_packets_buffer_size <= 16384")]
+    fn endpoint_rejects_received_packets_buffer_size_above_maximum() {
+        Endpoint::new(
+            Config {
+                received_packets_buffer_size: 16385,
+                ..test_config("oversized-received-buffer")
+            },
+            0.0,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "config.received_packets_buffer_size <= 16384")]
+    fn endpoint_rejects_received_packets_buffer_size_above_half_range() {
+        Endpoint::new(
+            Config {
+                received_packets_buffer_size: 32768,
+                ..test_config("oversized-received-buffer-half-range")
+            },
+            0.0,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "config.fragment_reassembly_buffer_size <= 16384")]
+    fn endpoint_rejects_fragment_reassembly_buffer_size_above_maximum() {
+        Endpoint::new(
+            Config {
+                fragment_reassembly_buffer_size: 16385,
+                ..test_config("oversized-reassembly-buffer")
+            },
+            0.0,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "config.fragment_reassembly_buffer_size <= 16384")]
+    fn endpoint_rejects_fragment_reassembly_buffer_size_above_half_range() {
+        Endpoint::new(
+            Config {
+                fragment_reassembly_buffer_size: 32768,
+                ..test_config("oversized-reassembly-buffer-half-range")
+            },
+            0.0,
+        );
+    }
+
+    #[test]
+    fn endpoint_accepts_maximum_packet_buffer_sizes() {
+        let config = Config {
+            sent_packets_buffer_size: 16384,
+            received_packets_buffer_size: 16384,
+            fragment_reassembly_buffer_size: 16384,
+            ..test_config("maximum-buffers")
+        };
+
+        let mut sender = Endpoint::new(config.clone(), 0.0);
+        let mut receiver = Endpoint::new(config, 0.0);
+
+        let packet = [0u8; 32];
+        let mut received = Vec::new();
+        sender.send_packet(&packet, |sequence, data| {
+            receiver.receive_packet(data, |received_sequence, _| {
+                assert_eq!(received_sequence, sequence);
+                received.push(received_sequence);
+                true
+            });
+        });
+
+        assert_eq!(received, vec![0]);
+        assert_eq!(receiver.counters().num_packets_received, 1);
+        assert_eq!(receiver.counters().num_packets_stale, 0);
+        assert_eq!(receiver.counters().num_packets_duplicate, 0);
     }
 
     // C 1.4.3 (259f4c8), reliable.c:624:

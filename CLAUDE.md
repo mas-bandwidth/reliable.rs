@@ -21,10 +21,11 @@ ours — no name trap. `cargo publish --dry-run` packages and compiles clean.
 **reliable.rs** is the Rust port of the C library
 [reliable](https://github.com/mas-bandwidth/reliable) — a packet acknowledgement system
 for UDP-based protocols (acks, fragmentation/reassembly, rtt/jitter/packet-loss/bandwidth
-stats). Published on crates.io as `reliable`. The library is about 2,900 lines across
-`src/lib.rs` (constants, sequence math), `src/sequence_buffer.rs`, `src/packet.rs`
-(header codec), and `src/endpoint.rs` (the endpoint, plus tests ported from the C
-library and additional Rust-specific cases at the bottom).
+stats). Published on crates.io as `reliable`. The library is ~2,900 lines including unit
+tests across `src/lib.rs` (constants, sequence math), `src/sequence_buffer.rs`,
+`src/packet.rs` (header codec), and `src/endpoint.rs` (the endpoint, plus tests ported
+from the C library and additional Rust-specific cases at the bottom); the v1.4.5 release
+was ~2,533 lines.
 
 Build and test:
 

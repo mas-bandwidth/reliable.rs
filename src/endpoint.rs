@@ -153,7 +153,7 @@ impl FragmentReassemblyData {
         fragment_id: usize,
         fragment_size: usize,
         mut fragment_data: &[u8],
-    ) {
+    ) -> bool {
         if fragment_id == 0 {
             let mut packet_header = [0u8; MAX_PACKET_HEADER_BYTES];
             let packet_header_bytes =
@@ -179,10 +179,11 @@ impl FragmentReassemblyData {
                 end_offset,
                 self.packet_data.len()
             );
-            return;
+            return false;
         }
 
         self.packet_data[offset..end_offset].copy_from_slice(fragment_data);
+        true
     }
 }
 
@@ -706,17 +707,17 @@ impl Endpoint {
                 fragment_header.num_fragments
             );
 
-            reassembly_data.num_fragments_received += 1;
-            reassembly_data.fragment_received[fragment_header.fragment_id] = true;
-
-            reassembly_data.store_fragment(
+            if reassembly_data.store_fragment(
                 fragment_header.sequence,
                 fragment_header.ack,
                 fragment_header.ack_bits,
                 fragment_header.fragment_id,
                 self.config.fragment_size,
                 &packet_data[fragment_header.bytes..],
-            );
+            ) {
+                reassembly_data.num_fragments_received += 1;
+                reassembly_data.fragment_received[fragment_header.fragment_id] = true;
+            }
 
             if reassembly_data.num_fragments_received == reassembly_data.num_fragments_total {
                 debug!(
@@ -1715,6 +1716,15 @@ mod tests {
         assert!(final_packet_delivered);
         assert_eq!(receiver.counters().num_packets_received, num_packets_sent);
         assert_eq!(receiver.counters().num_fragments_invalid, 0);
+    }
+
+    #[test]
+    fn store_fragment_rejects_out_of_bounds_fragment() {
+        let mut reassembly_data = FragmentReassemblyData::default();
+        reassembly_data.num_fragments_total = 2;
+        reassembly_data.packet_data = vec![0; MAX_PACKET_HEADER_BYTES];
+
+        assert!(!reassembly_data.store_fragment(0, 0, 0, 1, 1024, &[0; 1024]));
     }
 
     #[test]

@@ -473,10 +473,6 @@ impl Endpoint {
     /// the `process` closure as `(sequence, packet_data)`; return true to accept and ack
     /// the packet, false to reject it (rejected packets are not acked and may be
     /// processed again if they arrive again). Stale and duplicate packets are dropped.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `packet_data` is empty.
     pub fn receive_packet(
         &mut self,
         packet_data: &[u8],
@@ -490,7 +486,10 @@ impl Endpoint {
         packet_data: &[u8],
         process: &mut dyn FnMut(u16, &[u8]) -> bool,
     ) {
-        assert!(!packet_data.is_empty());
+        if packet_data.is_empty() {
+            self.counters.num_packets_invalid += 1;
+            return;
+        }
 
         let packet_bytes = packet_data.len();
 
@@ -1138,6 +1137,14 @@ mod tests {
             endpoint.config().max_fragments * endpoint.config().fragment_size,
             1000
         );
+    }
+
+    #[test]
+    fn receive_empty_packet_increments_invalid_counter() {
+        let mut endpoint = Endpoint::new(test_config("receiver"), 100.0);
+        let before = endpoint.counters().num_packets_invalid;
+        endpoint.receive_packet(&[], |_, _| true);
+        assert_eq!(endpoint.counters().num_packets_invalid, before + 1);
     }
 
     fn generate_packet_data_with_size(sequence: u16, packet_bytes: usize) -> Vec<u8> {

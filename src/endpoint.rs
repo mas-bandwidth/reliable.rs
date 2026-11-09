@@ -1628,21 +1628,29 @@ mod tests {
             100.0,
         );
 
-        let packet_data = [0u8; 16];
+        let packet_data = [0u8; TEST_MAX_PACKET_BYTES];
 
         let mut num_packets_sent: u64 = 0;
         for _ in 0..=32767 {
+            let packet_data = [0u8; 16];
             sender.send_packet(&packet_data, |_, data| {
                 receiver.receive_packet(data, |_, _| true);
             });
             num_packets_sent += 1;
         }
 
+        let mut final_packet_delivered = false;
         sender.send_packet(&packet_data, |_, data| {
-            receiver.receive_packet(data, |_, _| true);
+            receiver.receive_packet(data, |sequence, data| {
+                assert_eq!(sequence, 32768);
+                assert_eq!(data, &packet_data[..]);
+                final_packet_delivered = true;
+                true
+            });
         });
         num_packets_sent += 1;
 
+        assert!(final_packet_delivered);
         assert_eq!(receiver.counters().num_packets_received, num_packets_sent);
         assert_eq!(receiver.counters().num_fragments_invalid, 0);
     }

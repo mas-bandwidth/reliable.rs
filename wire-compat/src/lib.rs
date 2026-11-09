@@ -533,6 +533,7 @@ mod tests {
         let mut delivered_count = 0usize;
         let mut ack_count = 0usize;
         let mut max_delivered_bytes = 0usize;
+        let mut reordered_steps = 0usize;
 
         for step in 0..DIFFERENTIAL_STEPS {
             assert_eq!(rust_endpoint.next_packet_sequence(), unsafe {
@@ -559,9 +560,19 @@ mod tests {
 
             let mut to_deliver: Vec<Vec<u8>> = Vec::new();
             match rng.below(100) {
-                0..=69 => {
+                0..=59 => {
                     to_deliver.append(&mut held);
                     to_deliver.extend_from_slice(&rust_out);
+                }
+                60..=69 => {
+                    // Out-of-order delivery: the current (newer) packet is
+                    // delivered before any packet held from an earlier step,
+                    // so a valid newer packet arrives before an older one.
+                    if !held.is_empty() && !rust_out.is_empty() {
+                        reordered_steps += 1;
+                    }
+                    to_deliver.extend_from_slice(&rust_out);
+                    to_deliver.append(&mut held);
                 }
                 70..=78 => {
                     to_deliver.append(&mut held);
@@ -668,6 +679,10 @@ mod tests {
         // the stream was not vacuous: payloads of every size were delivered, acks
         // flowed, and the hostile datagrams hit the rejection paths on both sides
         assert!(delivered_count > 100, "too few payloads delivered");
+        assert!(
+            reordered_steps > 0,
+            "no valid packet was delivered out of order"
+        );
         assert!(ack_count > 0, "no acks were exchanged");
         assert!(
             max_delivered_bytes > FRAGMENT_ABOVE,

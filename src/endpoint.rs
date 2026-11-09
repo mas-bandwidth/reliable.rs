@@ -601,7 +601,7 @@ impl Endpoint {
                                 sent_packet_data.acked = true;
 
                                 let rtt = ((self.time - sent_packet_data.time) as f32) * 1000.0;
-                                debug_assert!(rtt >= 0.0);
+                                let rtt = rtt.max(0.0);
 
                                 let index = ack_sequence as usize % self.config.rtt_history_size;
                                 self.rtt_history_buffer[index] = rtt;
@@ -802,7 +802,7 @@ impl Endpoint {
     }
 
     /// Updates rtt, jitter, packet loss and bandwidth stats. Call once per-frame with
-    /// the current time in seconds.
+    /// the current time in seconds. `time` should be monotonically non-decreasing.
     pub fn update(&mut self, time: f64) {
         self.time = time;
 
@@ -2033,6 +2033,28 @@ mod tests {
         assert!((sender.jitter_avg_vs_min_rtt() - 15.0).abs() < 0.01);
         assert!((sender.jitter_max_vs_min_rtt() - 30.0).abs() < 0.01);
         assert!((sender.jitter_stddev_vs_avg_rtt() - 11.180_34).abs() < 0.01);
+    }
+
+    #[test]
+    fn rtt_samples_are_clamped_to_zero() {
+        let mut sender = Endpoint::new(test_config("sender"), 100.0);
+        let mut receiver = Endpoint::new(test_config("receiver"), 100.0);
+
+        let packet = [0u8; 8];
+
+        sender.send_packet(&packet, |_, data| {
+            receiver.receive_packet(data, |_, _| true);
+        });
+
+        // the ack arrives after the caller's clock has stepped backwards
+
+        sender.update(99.0);
+
+        receiver.send_packet(&packet, |_, data| {
+            sender.receive_packet(data, |_, _| true);
+        });
+
+        assert!(sender.rtt() >= 0.0);
     }
 
     #[test]

@@ -84,9 +84,8 @@ of coverage-guided fuzzing weekly. Dependabot watches actions + cargo.
 
 ## Releasing
 
-Tag `vX.Y.Z` + `gh release create`, then `cargo publish` (Glenn's crates.io credentials
-via `cargo login` on his machine). The `reliable` crate name is owned by Glenn's
-account. Deliberately not yet set up (offered 2026-07-12, deferred): crates.io trusted
+Tag `vX.Y.Z` + `gh release create`, then `cargo publish` (the owner's crates.io
+credentials). The `reliable` crate name belongs to the owner's account. Deliberately not yet set up (offered 2026-07-12, deferred): crates.io trusted
 publishing via GitHub OIDC, a second crate owner, and a cross-link from the C repo's
 README to this port.
 
@@ -95,7 +94,7 @@ README to this port.
 1.4.5 prepared: the vendored C reference is at 1.4.5, the port carries every upstream
 change from 1.4.1 through 1.4.5 that has a Rust analogue (see CHANGELOG.md for the
 per-version disposition), and the crate version follows. crates.io still has 1.3.4 —
-publishing is Glenn's hand, from his own machine account.
+publishing is done by the owner.
 
 v1.3.4 released: repo public, crate on crates.io, docs.rs built, CI fully green,
 branch protection active, topics set.

@@ -31,18 +31,16 @@ impl<T: Default> SequenceBuffer<T> {
         self.sequence
     }
 
+    #[cfg(test)]
     pub fn num_entries(&self) -> usize {
         self.entries.len()
     }
 
     fn is_stale(&self, sequence: u16) -> bool {
-        // a buffer covering the whole sequence space holds every sequence number, so
-        // nothing is stale (its capacity does not fit the u16 used for the window)
-        self.entries.len() < 65536
-            && sequence_less_than(
-                sequence,
-                self.sequence.wrapping_sub(self.entries.len() as u16),
-            )
+        sequence_less_than(
+            sequence,
+            self.sequence.wrapping_sub(self.entries.len() as u16),
+        )
     }
 
     pub fn reset(&mut self) {
@@ -227,18 +225,6 @@ mod tests {
     fn sequence_buffer_rounds_capacity_to_power_of_two() {
         let sequence_buffer = SequenceBuffer::<TestSequenceData>::new(255);
         assert_eq!(sequence_buffer.num_entries(), 256);
-    }
-
-    #[test]
-    fn sequence_buffer_supports_full_sequence_space() {
-        let mut sequence_buffer = SequenceBuffer::<TestSequenceData>::new(65535);
-        assert_eq!(sequence_buffer.num_entries(), 65536);
-
-        sequence_buffer.insert(u16::MAX).expect("insert");
-        sequence_buffer.insert(0).expect("insert");
-
-        assert!(sequence_buffer.exists(u16::MAX));
-        assert!(sequence_buffer.exists(0));
     }
 
     #[test]

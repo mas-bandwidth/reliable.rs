@@ -562,7 +562,7 @@ impl Endpoint {
             let packet_payload_bytes = packet_bytes - header.bytes;
 
             if packet_payload_bytes > self.config.max_packet_size {
-                error!(
+                debug!(
                     "[{}] packet too large to receive. packet is at {} bytes, maximum is {}",
                     self.config.name, packet_payload_bytes, self.config.max_packet_size
                 );
@@ -654,7 +654,7 @@ impl Endpoint {
                     ack_bits >>= 1;
                 }
             } else {
-                error!("[{}] process packet failed", self.config.name);
+                debug!("[{}] process packet failed", self.config.name);
             }
         } else {
             // fragment packet
@@ -686,7 +686,7 @@ impl Endpoint {
                     .fragment_reassembly
                     .insert_advance_first(fragment_header.sequence)
                 else {
-                    error!(
+                    debug!(
                         "[{}] ignoring invalid fragment. could not insert in reassembly buffer (stale)",
                         self.config.name
                     );
@@ -709,7 +709,7 @@ impl Endpoint {
                 .expect("reassembly data");
 
             if fragment_header.num_fragments != reassembly_data.num_fragments_total {
-                error!(
+                debug!(
                     "[{}] ignoring invalid fragment. fragment count mismatch. expected {}, got {}",
                     self.config.name,
                     reassembly_data.num_fragments_total,
@@ -720,7 +720,7 @@ impl Endpoint {
             }
 
             if reassembly_data.fragment_received[fragment_header.fragment_id] {
-                error!(
+                debug!(
                     "[{}] ignoring fragment {} of packet {}. fragment already received",
                     self.config.name, fragment_header.fragment_id, fragment_header.sequence
                 );

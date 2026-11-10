@@ -647,7 +647,7 @@ mod tests {
 
             assert_eq!(
                 &rust_delivered[rust_start..],
-                unsafe { &(*c_context).delivered[c_start..] },
+                unsafe { &(&(*c_context).delivered)[c_start..] },
                 "delivered payloads diverged at step {step}"
             );
 

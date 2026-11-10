@@ -92,14 +92,14 @@ mod tests {
     }
 
     impl CContext {
-        fn new() -> Box<Self> {
-            Box::new(Self {
+        fn new() -> Self {
+            Self {
                 transcript: Vec::new(),
                 forward_to_peer: std::ptr::null_mut(),
                 num_processed: 0,
                 num_invalid_payloads: 0,
                 delivered: Vec::new(),
-            })
+            }
         }
     }
 
@@ -165,12 +165,12 @@ mod tests {
             100.0,
         );
 
-        let mut c_context = CContext::new();
+        let c_context = Box::into_raw(Box::new(CContext::new()));
         let c_endpoint = unsafe {
             wire_compat_endpoint_create(
                 FRAGMENT_ABOVE as c_int,
                 1,
-                (&mut *c_context as *mut CContext).cast(),
+                c_context.cast(),
                 c_transmit,
                 c_process,
             )
@@ -212,7 +212,7 @@ mod tests {
                         payload.len() as c_int,
                     );
                 }
-                for datagram in c_context.transcript.drain(..) {
+                for datagram in unsafe { (*c_context).transcript.drain(..) } {
                     rust_endpoint.receive_packet(&datagram, |_, data| {
                         if !payload_is_valid(data) {
                             rust_num_invalid_payloads += 1;
@@ -233,8 +233,8 @@ mod tests {
 
         // every payload was delivered exactly once, intact, in both directions
 
-        assert_eq!(c_context.num_processed, NUM_ITERATIONS);
-        assert_eq!(c_context.num_invalid_payloads, 0);
+        assert_eq!(unsafe { (*c_context).num_processed }, NUM_ITERATIONS);
+        assert_eq!(unsafe { (*c_context).num_invalid_payloads }, 0);
         assert_eq!(rust_num_processed, NUM_ITERATIONS);
         assert_eq!(rust_num_invalid_payloads, 0);
 
@@ -251,7 +251,10 @@ mod tests {
         assert_eq!(rust_acks, expected_rust_acks);
         assert_eq!(c_acks, expected_c_acks);
 
-        unsafe { reliable_endpoint_destroy(c_endpoint) };
+        unsafe {
+            reliable_endpoint_destroy(c_endpoint);
+            drop(Box::from_raw(c_context));
+        }
     }
 
     /// A Rust endpoint pair and a C endpoint pair are driven through the same
@@ -279,25 +282,25 @@ mod tests {
 
         // c pair, forwarding to each other inside the transmit callback and recording
 
-        let mut context_a = CContext::new();
-        let mut context_b = CContext::new();
+        let context_a = Box::into_raw(Box::new(CContext::new()));
+        let context_b = Box::into_raw(Box::new(CContext::new()));
         let (c_a, c_b) = unsafe {
             let c_a = wire_compat_endpoint_create(
                 FRAGMENT_ABOVE as c_int,
                 0,
-                (&mut *context_a as *mut CContext).cast(),
+                context_a.cast(),
                 c_transmit,
                 c_process,
             );
             let c_b = wire_compat_endpoint_create(
                 FRAGMENT_ABOVE as c_int,
                 1,
-                (&mut *context_b as *mut CContext).cast(),
+                context_b.cast(),
                 c_transmit,
                 c_process,
             );
-            context_a.forward_to_peer = c_b;
-            context_b.forward_to_peer = c_a;
+            (*context_a).forward_to_peer = c_b;
+            (*context_b).forward_to_peer = c_a;
             (c_a, c_b)
         };
         assert!(!c_a.is_null() && !c_b.is_null());
@@ -350,17 +353,19 @@ mod tests {
 
         // both implementations processed every packet and put identical bytes on the wire
 
-        assert_eq!(context_a.num_processed, NUM_ITERATIONS);
-        assert_eq!(context_b.num_processed, NUM_ITERATIONS);
-        assert_eq!(context_a.num_invalid_payloads, 0);
-        assert_eq!(context_b.num_invalid_payloads, 0);
+        assert_eq!(unsafe { (*context_a).num_processed }, NUM_ITERATIONS);
+        assert_eq!(unsafe { (*context_b).num_processed }, NUM_ITERATIONS);
+        assert_eq!(unsafe { (*context_a).num_invalid_payloads }, 0);
+        assert_eq!(unsafe { (*context_b).num_invalid_payloads }, 0);
 
-        assert_eq!(rust_a_transcript, context_a.transcript);
-        assert_eq!(rust_b_transcript, context_b.transcript);
+        assert_eq!(&rust_a_transcript, unsafe { &(*context_a).transcript });
+        assert_eq!(&rust_b_transcript, unsafe { &(*context_b).transcript });
 
         unsafe {
             reliable_endpoint_destroy(c_a);
             reliable_endpoint_destroy(c_b);
+            drop(Box::from_raw(context_a));
+            drop(Box::from_raw(context_b));
         }
     }
 
@@ -443,12 +448,12 @@ mod tests {
             100.0,
         );
 
-        let mut c_context = CContext::new();
+        let c_context = Box::into_raw(Box::new(CContext::new()));
         let c_endpoint = unsafe {
             wire_compat_endpoint_create(
                 FRAGMENT_ABOVE as c_int,
                 1,
-                (&mut *c_context as *mut CContext).cast(),
+                c_context.cast(),
                 c_transmit,
                 c_process,
             )
@@ -480,7 +485,7 @@ mod tests {
                     c_payload.len() as c_int,
                 );
             }
-            let c_out: Vec<Vec<u8>> = c_context.transcript.drain(..).collect();
+            let c_out: Vec<Vec<u8>> = unsafe { (*c_context).transcript.drain(..).collect() };
             assert_eq!(rust_out, c_out, "outgoing datagrams diverged in warm-up");
 
             for datagram in &rust_out {
@@ -522,7 +527,7 @@ mod tests {
         );
 
         rust_delivered.clear();
-        c_context.delivered.clear();
+        unsafe { (*c_context).delivered.clear() };
 
         // Seeded mixed stream. Most steps deliver normally, but duplicates, one-step
         // reordering, drops, truncation, header corruption and random garbage are mixed
@@ -552,7 +557,7 @@ mod tests {
                     c_payload.len() as c_int,
                 );
             }
-            let c_out: Vec<Vec<u8>> = c_context.transcript.drain(..).collect();
+            let c_out: Vec<Vec<u8>> = unsafe { (*c_context).transcript.drain(..).collect() };
             assert_eq!(
                 rust_out, c_out,
                 "outgoing datagrams diverged at step {step}"
@@ -620,7 +625,7 @@ mod tests {
             }
 
             let rust_start = rust_delivered.len();
-            let c_start = c_context.delivered.len();
+            let c_start = unsafe { (*c_context).delivered.len() };
 
             for datagram in &to_deliver {
                 if datagram.is_empty() {
@@ -641,8 +646,8 @@ mod tests {
             }
 
             assert_eq!(
-                rust_delivered[rust_start..],
-                c_context.delivered[c_start..],
+                &rust_delivered[rust_start..],
+                unsafe { &(&(*c_context).delivered)[c_start..] },
                 "delivered payloads diverged at step {step}"
             );
 
@@ -700,6 +705,9 @@ mod tests {
             "hostile datagrams did not reach any rejection path"
         );
 
-        unsafe { reliable_endpoint_destroy(c_endpoint) };
+        unsafe {
+            reliable_endpoint_destroy(c_endpoint);
+            drop(Box::from_raw(c_context));
+        }
     }
 }

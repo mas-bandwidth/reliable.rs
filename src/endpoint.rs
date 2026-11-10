@@ -36,13 +36,13 @@ pub struct Config {
     /// Number of packets that can be under reassembly from fragments at the same time.
     /// Rounded up to a power of two.
     pub fragment_reassembly_buffer_size: usize,
-    /// Exponential smoothing factor for the rtt moving average.
+    /// Exponential smoothing factor for the rtt moving average. Must be in `[0.0, 1.0]`.
     pub rtt_smoothing_factor: f32,
     /// Number of rtt samples kept for min/max/avg rtt and jitter.
     pub rtt_history_size: usize,
-    /// Exponential smoothing factor for packet loss.
+    /// Exponential smoothing factor for packet loss. Must be in `[0.0, 1.0]`.
     pub packet_loss_smoothing_factor: f32,
-    /// Exponential smoothing factor for bandwidth.
+    /// Exponential smoothing factor for bandwidth. Must be in `[0.0, 1.0]`.
     pub bandwidth_smoothing_factor: f32,
     /// Assumed network header overhead per-packet, used only for bandwidth stats. 28 = IPv4 + UDP.
     pub packet_header_size: usize,
@@ -1257,6 +1257,21 @@ mod tests {
             endpoint.config().max_fragments * endpoint.config().fragment_size,
             1000
         );
+    }
+
+    #[test]
+    fn endpoint_accepts_smoothing_factor_boundaries() {
+        for smoothing_factor in [0.0, 1.0] {
+            Endpoint::new(
+                Config {
+                    rtt_smoothing_factor: smoothing_factor,
+                    packet_loss_smoothing_factor: smoothing_factor,
+                    bandwidth_smoothing_factor: smoothing_factor,
+                    ..test_config("smoothing-boundary")
+                },
+                0.0,
+            );
+        }
     }
 
     #[test]

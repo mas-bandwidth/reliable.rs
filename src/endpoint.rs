@@ -751,7 +751,7 @@ impl Endpoint {
                 fragment_header.num_fragments
             );
 
-            if reassembly_data.store_fragment(
+            if !reassembly_data.store_fragment(
                 fragment_header.sequence,
                 fragment_header.ack,
                 fragment_header.ack_bits,
@@ -759,9 +759,16 @@ impl Endpoint {
                 self.config.fragment_size,
                 &packet_data[fragment_header.bytes..],
             ) {
-                reassembly_data.num_fragments_received += 1;
-                reassembly_data.fragment_received[fragment_header.fragment_id] = true;
+                error!(
+                    "[{}] ignoring fragment {} of packet {}. could not store fragment data",
+                    self.config.name, fragment_header.fragment_id, fragment_header.sequence
+                );
+                self.counters.num_fragments_invalid += 1;
+                return;
             }
+
+            reassembly_data.num_fragments_received += 1;
+            reassembly_data.fragment_received[fragment_header.fragment_id] = true;
 
             if reassembly_data.num_fragments_received == reassembly_data.num_fragments_total {
                 debug!(
@@ -1940,6 +1947,9 @@ mod tests {
             .expect("reassembly data");
         assert_eq!(reassembly_data.num_fragments_received, 0);
         assert!(!reassembly_data.fragment_received[fragment_id]);
+
+        assert_eq!(receiver.counters().num_fragments_received, 0);
+        assert_eq!(receiver.counters().num_fragments_invalid, 1);
     }
 
     #[test]

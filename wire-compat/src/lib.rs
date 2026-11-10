@@ -485,7 +485,7 @@ mod tests {
                     c_payload.len() as c_int,
                 );
             }
-            let c_out: Vec<Vec<u8>> = unsafe { (*c_context).transcript.drain(..).collect() };
+            let c_out: Vec<Vec<u8>> = unsafe { std::mem::take(&mut (*c_context).transcript) };
             assert_eq!(rust_out, c_out, "outgoing datagrams diverged in warm-up");
 
             for datagram in &rust_out {
@@ -557,7 +557,7 @@ mod tests {
                     c_payload.len() as c_int,
                 );
             }
-            let c_out: Vec<Vec<u8>> = unsafe { (*c_context).transcript.drain(..).collect() };
+            let c_out: Vec<Vec<u8>> = unsafe { std::mem::take(&mut (*c_context).transcript) };
             assert_eq!(
                 rust_out, c_out,
                 "outgoing datagrams diverged at step {step}"

@@ -1751,18 +1751,22 @@ mod tests {
 
     #[test]
     fn store_fragment_rejects_out_of_bounds_fragment() {
-        let mut reassembly_data = FragmentReassemblyData::default();
-        reassembly_data.num_fragments_total = 2;
-        reassembly_data.packet_data = vec![0; MAX_PACKET_HEADER_BYTES];
+        let mut reassembly_data = FragmentReassemblyData {
+            num_fragments_total: 2,
+            packet_data: vec![0; MAX_PACKET_HEADER_BYTES],
+            ..Default::default()
+        };
 
         assert!(!reassembly_data.store_fragment(0, 0, 0, 1, 1024, &[0; 1024]));
     }
 
     #[test]
     fn store_fragment_accepts_in_bounds_fragment() {
-        let mut reassembly_data = FragmentReassemblyData::default();
-        reassembly_data.num_fragments_total = 2;
-        reassembly_data.packet_data = vec![0; MAX_PACKET_HEADER_BYTES + 2 * 1024];
+        let mut reassembly_data = FragmentReassemblyData {
+            num_fragments_total: 2,
+            packet_data: vec![0; MAX_PACKET_HEADER_BYTES + 2 * 1024],
+            ..Default::default()
+        };
 
         assert!(reassembly_data.store_fragment(0, 0, 0, 1, 1024, &[0; 1024]));
     }

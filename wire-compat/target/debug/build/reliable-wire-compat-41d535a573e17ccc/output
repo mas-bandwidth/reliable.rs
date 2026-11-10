@@ -1,3 +1,0 @@
-cargo:rerun-if-changed=c
-cargo:rustc-link-lib=static=reliable_c
-cargo:rustc-link-search=native=/home/nova/.local/state/nova-worker/amd-1/jobs/rel-rs-ffi-aliasing.w2/repo/wire-compat/target/debug/build/reliable-wire-compat-41d535a573e17ccc/out

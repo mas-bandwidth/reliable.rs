@@ -1728,6 +1728,15 @@ mod tests {
     }
 
     #[test]
+    fn store_fragment_accepts_in_bounds_fragment() {
+        let mut reassembly_data = FragmentReassemblyData::default();
+        reassembly_data.num_fragments_total = 2;
+        reassembly_data.packet_data = vec![0; MAX_PACKET_HEADER_BYTES + 2 * 1024];
+
+        assert!(reassembly_data.store_fragment(0, 0, 0, 1, 1024, &[0; 1024]));
+    }
+
+    #[test]
     fn rejected_fragment_does_not_count_as_received() {
         let mut receiver = Endpoint::new(test_config("receiver"), 100.0);
 

@@ -22,16 +22,31 @@ pub struct Config {
     pub fragment_above: usize,
     /// Maximum number of fragments per-packet. 256 max. Must be large enough to cover
     /// `max_packet_size` at `fragment_size` bytes per fragment.
+    ///
+    /// The receiver drops a fragment whose packet has more fragments than its own
+    /// `max_fragments`, so it must be at least the fragment count the other side sends.
     pub max_fragments: usize,
     /// Size of each fragment (bytes).
+    ///
+    /// Both sides must use the same value: the receiver drops a fragment larger than its
+    /// own `fragment_size`, and any fragment but the last that is not exactly that size.
     pub fragment_size: usize,
     /// Maximum number of acks buffered between calls to [`Endpoint::clear_acks`].
     pub ack_buffer_size: usize,
     /// Number of sent packets tracked for acks, packet loss and bandwidth stats. Rounded
     /// up to a power of two.
+    ///
+    /// Packet loss is sampled over the oldest `sent_packets_buffer_size / 2` entries, so
+    /// a value below 4 measures it over at most one packet, and a value of 1 never
+    /// measures it (it reads 0). Sent and acked bandwidth are sampled over the oldest
+    /// half of the rounded buffer and need two samples, so a value of 1 or 2 never
+    /// measures them (they read 0).
     pub sent_packets_buffer_size: usize,
     /// Number of received packets tracked. Also the window for stale and duplicate packet
     /// rejection. Rounded up to a power of two.
+    ///
+    /// Received bandwidth is sampled over the oldest half of the rounded buffer and needs
+    /// two samples, so a value of 1 or 2 never measures it (it reads 0).
     pub received_packets_buffer_size: usize,
     /// Number of packets that can be under reassembly from fragments at the same time.
     /// Rounded up to a power of two.
@@ -99,13 +114,24 @@ pub struct Counters {
 }
 
 /// Bandwidth statistics, in kilobits per-second.
+///
+/// Each figure is computed by [`Endpoint::update`] from the send or receive times of
+/// the packets in its window, not from the current time, so when traffic stops the
+/// figures settle on the rate of the last packets in the window rather than falling to
+/// zero.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Bandwidth {
-    /// Outgoing bandwidth over the sent packet window.
+    /// Outgoing bandwidth over the sent packet window. Each sent packet counts once as
+    /// [`Config::packet_header_size`] plus its payload, whether or not it was
+    /// fragmented; reliable's own packet and fragment headers are not counted.
     pub sent_kbps: f32,
-    /// Incoming bandwidth over the received packet window.
+    /// Incoming bandwidth over the received packet window. Each packet accepted by the
+    /// `process` closure counts as [`Config::packet_header_size`] plus the packet as
+    /// received, including reliable's packet header (for a fragmented packet, the
+    /// reassembled packet, without fragment headers). Rejected packets are not counted.
     pub received_kbps: f32,
-    /// Outgoing bandwidth restricted to packets that were acked.
+    /// Outgoing bandwidth restricted to packets that were acked, counted as for
+    /// `sent_kbps`.
     pub acked_kbps: f32,
 }
 
@@ -481,6 +507,10 @@ impl Endpoint {
     /// the `process` closure as `(sequence, packet_data)`; return true to accept and ack
     /// the packet, false to reject it (rejected packets are not acked and may be
     /// processed again if they arrive again). Stale and duplicate packets are dropped.
+    ///
+    /// The acks a packet carries for packets this endpoint sent are applied only when
+    /// `process` accepts it: the acks in a rejected packet are discarded, and are
+    /// reported only if a later accepted packet carries them again.
     pub fn receive_packet(
         &mut self,
         packet_data: &[u8],
@@ -533,7 +563,7 @@ impl Endpoint {
             let packet_payload_bytes = packet_bytes - header.bytes;
 
             if packet_payload_bytes > self.config.max_packet_size {
-                error!(
+                debug!(
                     "[{}] packet too large to receive. packet is at {} bytes, maximum is {}",
                     self.config.name, packet_payload_bytes, self.config.max_packet_size
                 );
@@ -602,7 +632,7 @@ impl Endpoint {
                                 sent_packet_data.acked = true;
 
                                 let rtt = ((self.time - sent_packet_data.time) as f32) * 1000.0;
-                                debug_assert!(rtt >= 0.0);
+                                let rtt = rtt.max(0.0);
 
                                 let index = ack_sequence as usize % self.config.rtt_history_size;
                                 self.rtt_history_buffer[index] = rtt;
@@ -625,7 +655,7 @@ impl Endpoint {
                     ack_bits >>= 1;
                 }
             } else {
-                error!("[{}] process packet failed", self.config.name);
+                debug!("[{}] process packet failed", self.config.name);
             }
         } else {
             // fragment packet
@@ -657,7 +687,7 @@ impl Endpoint {
                     .fragment_reassembly
                     .insert_advance_first(fragment_header.sequence)
                 else {
-                    error!(
+                    debug!(
                         "[{}] ignoring invalid fragment. could not insert in reassembly buffer (stale)",
                         self.config.name
                     );
@@ -680,7 +710,7 @@ impl Endpoint {
                 .expect("reassembly data");
 
             if fragment_header.num_fragments != reassembly_data.num_fragments_total {
-                error!(
+                debug!(
                     "[{}] ignoring invalid fragment. fragment count mismatch. expected {}, got {}",
                     self.config.name,
                     reassembly_data.num_fragments_total,
@@ -691,7 +721,7 @@ impl Endpoint {
             }
 
             if reassembly_data.fragment_received[fragment_header.fragment_id] {
-                error!(
+                debug!(
                     "[{}] ignoring fragment {} of packet {}. fragment already received",
                     self.config.name, fragment_header.fragment_id, fragment_header.sequence
                 );
@@ -803,7 +833,7 @@ impl Endpoint {
     }
 
     /// Updates rtt, jitter, packet loss and bandwidth stats. Call once per-frame with
-    /// the current time in seconds.
+    /// the current time in seconds. `time` should be monotonically non-decreasing.
     pub fn update(&mut self, time: f64) {
         self.time = time;
 
@@ -973,7 +1003,8 @@ impl Endpoint {
         self.packet_loss
     }
 
-    /// Sent, received and acked bandwidth in kilobits per-second.
+    /// Sent, received and acked bandwidth in kilobits per-second. See [`Bandwidth`] for
+    /// what each figure counts.
     pub fn bandwidth(&self) -> Bandwidth {
         Bandwidth {
             sent_kbps: self.sent_bandwidth_kbps,
@@ -2086,6 +2117,28 @@ mod tests {
     }
 
     #[test]
+    fn rtt_samples_are_clamped_to_zero() {
+        let mut sender = Endpoint::new(test_config("sender"), 100.0);
+        let mut receiver = Endpoint::new(test_config("receiver"), 100.0);
+
+        let packet = [0u8; 8];
+
+        sender.send_packet(&packet, |_, data| {
+            receiver.receive_packet(data, |_, _| true);
+        });
+
+        // the ack arrives after the caller's clock has stepped backwards
+
+        sender.update(99.0);
+
+        receiver.send_packet(&packet, |_, data| {
+            sender.receive_packet(data, |_, _| true);
+        });
+
+        assert!(sender.rtt() >= 0.0);
+    }
+
+    #[test]
     fn packet_loss_statistic() {
         let mut time = 100.0;
 
@@ -2188,5 +2241,392 @@ mod tests {
         assert!((bandwidth.sent_kbps - expected_sent).abs() < 0.01);
         assert!((bandwidth.received_kbps - expected_received).abs() < 0.01);
         assert!((bandwidth.acked_kbps - expected_sent).abs() < 0.01);
+    }
+
+    // the sequence number crosses 65535 -> 0
+
+    #[test]
+    fn test_sequence_wrap() {
+        let time = 100.0;
+
+        let mut sender = Endpoint::new(test_config("sender"), time);
+        let mut receiver = Endpoint::new(test_config("receiver"), time);
+
+        let num_iterations: usize = 65536 + 64;
+        let mut acked = [false; 65536];
+        let dummy_packet = [0u8; 8];
+
+        for _ in 0..num_iterations {
+            sender.send_packet(&dummy_packet, |_, data| {
+                receiver.receive_packet(data, |_, _| true);
+            });
+            receiver.send_packet(&dummy_packet, |_, data| {
+                sender.receive_packet(data, |_, _| true);
+            });
+
+            for &ack in sender.acks() {
+                acked[ack as usize] = true;
+            }
+
+            sender.clear_acks();
+            receiver.clear_acks();
+        }
+
+        assert_eq!(sender.next_packet_sequence(), num_iterations as u16);
+
+        // the sequences either side of the wrap were acked like any others
+
+        assert!(acked[65533]);
+        assert!(acked[65534]);
+        assert!(acked[65535]);
+        assert!(acked[0]);
+        assert!(acked[1]);
+        assert!(acked[2]);
+
+        for i in 0..65536 {
+            assert!(acked[i]);
+        }
+
+        assert_eq!(
+            receiver.counters().num_packets_received,
+            num_iterations as u64
+        );
+    }
+
+    // fragment counts at both ends of the range, and a payload that is an exact
+    // multiple of the fragment size
+
+    fn test_fragment_case(
+        fragment_size: usize,
+        max_fragments: usize,
+        packet_bytes: usize,
+        expected_fragments: usize,
+    ) {
+        let mut num_processed = 0;
+        let mut processed: Vec<u8> = Vec::new();
+
+        let config = |name: &str| Config {
+            fragment_size,
+            max_fragments,
+            max_packet_size: fragment_size * max_fragments,
+            fragment_above: fragment_size,
+            ..test_config(name)
+        };
+
+        let mut sender = Endpoint::new(config("sender"), 100.0);
+        let mut receiver = Endpoint::new(config("receiver"), 100.0);
+
+        let packet: Vec<u8> = (0..packet_bytes).map(|i| ((i * 31) + 7) as u8).collect();
+
+        sender.send_packet(&packet, |_, data| {
+            receiver.receive_packet(data, |_, data| {
+                num_processed += 1;
+                processed = data.to_vec();
+                true
+            });
+        });
+
+        assert_eq!(num_processed, 1);
+        assert_eq!(processed.len(), packet_bytes);
+        assert_eq!(processed, packet);
+
+        let fragments_sent = sender.counters().num_fragments_sent;
+        let fragments_received = receiver.counters().num_fragments_received;
+
+        if expected_fragments == 0 {
+            // below the threshold: sent whole, no fragments at all
+            assert_eq!(fragments_sent, 0);
+            assert_eq!(fragments_received, 0);
+        } else {
+            assert_eq!(fragments_sent, expected_fragments as u64);
+            assert_eq!(fragments_received, expected_fragments as u64);
+        }
+    }
+
+    #[test]
+    fn test_fragment_counts() {
+        // an exact multiple of the fragment size, where the last fragment is full rather
+        // than a remainder
+        test_fragment_case(512, 16, 512 * 4, 4);
+
+        // the largest packet the config allows, again an exact multiple
+        test_fragment_case(512, 16, 512 * 16, 16);
+
+        // one fragment: above the threshold by a single byte
+        test_fragment_case(512, 16, 513, 2);
+        test_fragment_case(64, 256, 65, 2);
+
+        // 256 fragments, the maximum the wire format can express
+        test_fragment_case(64, 256, 64 * 256, 256);
+        test_fragment_case(64, 256, 64 * 255 + 1, 256);
+
+        // at or below the threshold the packet is not fragmented
+        test_fragment_case(512, 16, 512, 0);
+        test_fragment_case(512, 16, 1, 0);
+    }
+
+    // truncated packets and fragments are rejected rather than acted on
+
+    #[test]
+    fn test_truncated_packets() {
+        let mut num_processed = 0;
+        let mut captured: Vec<Vec<u8>> = Vec::new();
+
+        let config = |name: &str| Config {
+            fragment_size: 256,
+            max_fragments: 16,
+            max_packet_size: 256 * 16,
+            fragment_above: 256,
+            ..test_config(name)
+        };
+
+        let mut sender = Endpoint::new(config("sender"), 100.0);
+        let mut receiver = Endpoint::new(config("receiver"), 100.0);
+
+        // an unfragmented packet, captured on the wire
+
+        let packet = [0xABu8; 200];
+        sender.send_packet(&packet, |_, data| captured.push(data.to_vec()));
+        assert_eq!(captured.len(), 1);
+
+        let whole_bytes = captured[0].len();
+
+        // every truncation of it shorter than the header is rejected, and none is processed
+
+        for truncated_bytes in 1..4 {
+            receiver.receive_packet(&captured[0][..truncated_bytes], |_, _| {
+                num_processed += 1;
+                true
+            });
+        }
+
+        assert_eq!(receiver.counters().num_packets_invalid, 3);
+        assert_eq!(num_processed, 0);
+
+        // the whole packet still arrives
+
+        receiver.receive_packet(&captured[0][..whole_bytes], |_, _| {
+            num_processed += 1;
+            true
+        });
+        assert_eq!(num_processed, 1);
+
+        // now a fragmented packet
+
+        captured.clear();
+
+        let large_packet = [0xCDu8; 1024];
+        sender.send_packet(&large_packet, |_, data| captured.push(data.to_vec()));
+        assert_eq!(captured.len(), 4);
+
+        // a fragment truncated inside its header is rejected
+
+        for truncated_bytes in 1..FRAGMENT_HEADER_BYTES {
+            receiver.receive_packet(&captured[1][..truncated_bytes], |_, _| {
+                num_processed += 1;
+                true
+            });
+        }
+
+        assert_eq!(receiver.counters().num_fragments_received, 0);
+        assert_eq!(
+            receiver.counters().num_fragments_invalid,
+            (FRAGMENT_HEADER_BYTES - 1) as u64
+        );
+
+        // a fragment that is not the last one must carry exactly fragment_size bytes, so
+        // a truncated body is rejected too
+
+        let fragment_one_bytes = captured[1].len();
+        receiver.receive_packet(&captured[1][..fragment_one_bytes - 1], |_, _| {
+            num_processed += 1;
+            true
+        });
+        assert_eq!(receiver.counters().num_fragments_received, 0);
+        assert_eq!(
+            receiver.counters().num_fragments_invalid,
+            FRAGMENT_HEADER_BYTES as u64
+        );
+        assert_eq!(num_processed, 1);
+
+        // the intact fragments reassemble
+
+        for fragment in &captured {
+            receiver.receive_packet(fragment, |_, _| {
+                num_processed += 1;
+                true
+            });
+        }
+
+        assert_eq!(receiver.counters().num_fragments_received, 4);
+        assert_eq!(num_processed, 2);
+    }
+
+    #[test]
+    fn test_rtt() {
+        let mut time = 100.0;
+        let delta_time = 0.01;
+
+        let mut sender = Endpoint::new(test_config("sender"), time);
+        let mut receiver = Endpoint::new(test_config("receiver"), time);
+
+        let dummy_packet = [0u8; 8];
+
+        // step time between the send and the reply so each acknowledgment carries a real
+        // round trip rather than a zero sample
+
+        for _ in 0..1000 {
+            sender.send_packet(&dummy_packet, |_, data| {
+                receiver.receive_packet(data, |_, _| true);
+            });
+
+            time += delta_time;
+            sender.update(time);
+            receiver.update(time);
+
+            receiver.send_packet(&dummy_packet, |_, data| {
+                sender.receive_packet(data, |_, _| true);
+            });
+
+            time += delta_time;
+            sender.update(time);
+            receiver.update(time);
+
+            sender.clear_acks();
+            receiver.clear_acks();
+        }
+
+        let rtt = sender.rtt();
+        let rtt_min = sender.rtt_min();
+        let rtt_max = sender.rtt_max();
+        let rtt_avg = sender.rtt_avg();
+
+        assert!(rtt.is_finite() && rtt > 0.0);
+        assert!(rtt_min >= 0.0 && rtt_min <= rtt_avg && rtt_avg <= rtt_max);
+        assert!(rtt_max < 1000.0); // rtt is in milliseconds
+    }
+
+    // captures log records on the current thread only, so tests running in parallel
+    // neither see each other's records nor pay for formatting when not capturing
+
+    mod capture {
+        use std::cell::RefCell;
+        use std::sync::Once;
+
+        thread_local! {
+            static RECORDS: RefCell<Option<Vec<(log::Level, String)>>> = const { RefCell::new(None) };
+        }
+
+        struct CaptureLogger;
+
+        impl log::Log for CaptureLogger {
+            fn enabled(&self, _: &log::Metadata) -> bool {
+                RECORDS.with(|r| r.borrow().is_some())
+            }
+
+            fn log(&self, record: &log::Record) {
+                RECORDS.with(|r| {
+                    if let Some(records) = r.borrow_mut().as_mut() {
+                        records.push((record.level(), record.args().to_string()));
+                    }
+                });
+            }
+
+            fn flush(&self) {}
+        }
+
+        static LOGGER: CaptureLogger = CaptureLogger;
+        static INIT: Once = Once::new();
+
+        pub fn records(f: impl FnOnce()) -> Vec<(log::Level, String)> {
+            INIT.call_once(|| {
+                log::set_logger(&LOGGER).expect("no other logger is installed in tests");
+                log::set_max_level(log::LevelFilter::Trace);
+            });
+            RECORDS.with(|r| *r.borrow_mut() = Some(Vec::new()));
+            f();
+            RECORDS.with(|r| r.borrow_mut().take().expect("capture records"))
+        }
+    }
+
+    fn assert_logged_at_debug(records: &[(log::Level, String)], message: &str) {
+        assert!(
+            records
+                .iter()
+                .any(|(level, text)| *level == log::Level::Debug && text.contains(message)),
+            "expected a debug record containing {message:?}, got {records:?}"
+        );
+        assert!(
+            records.iter().all(|(level, _)| *level != log::Level::Error),
+            "expected no error records, got {records:?}"
+        );
+    }
+
+    fn send_fragments(sender: &mut Endpoint, packet_bytes: usize) -> Vec<Vec<u8>> {
+        let packet_data = vec![0x5a; packet_bytes];
+        let mut fragments = Vec::new();
+        sender.send_packet(&packet_data, |_, data| fragments.push(data.to_vec()));
+        fragments
+    }
+
+    #[test]
+    fn ordinary_receive_events_log_at_debug() {
+        let time = 1000.0;
+
+        // payload above max_packet_size, inside the receive gate
+
+        let mut receiver = Endpoint::new(test_config("receiver"), time);
+        let mut packet = vec![0u8; MAX_PACKET_HEADER_BYTES];
+        let header_bytes = write_packet_header(&mut packet, 0, 0, 0);
+        packet.truncate(header_bytes);
+        packet.resize(header_bytes + receiver.config.max_packet_size + 1, 0x5a);
+        let records = capture::records(|| receiver.receive_packet(&packet, |_, _| true));
+        assert_logged_at_debug(&records, "packet too large to receive");
+        assert_eq!(receiver.counters().num_packets_too_large_to_receive, 1);
+
+        // packet rejected by the process closure
+
+        let mut sender = Endpoint::new(test_config("sender"), time);
+        let mut receiver = Endpoint::new(test_config("receiver"), time);
+        let mut packets = Vec::new();
+        sender.send_packet(&[1, 2, 3], |_, data| packets.push(data.to_vec()));
+        let records = capture::records(|| receiver.receive_packet(&packets[0], |_, _| false));
+        assert_logged_at_debug(&records, "process packet failed");
+
+        // fragment of a packet too old for the reassembly buffer
+
+        let mut sender = Endpoint::new(test_config("sender"), time);
+        let mut receiver = Endpoint::new(test_config("receiver"), time);
+        let reassembly_size = receiver.config.fragment_reassembly_buffer_size;
+        let old_fragments = send_fragments(&mut sender, 3000);
+        for _ in 1..reassembly_size {
+            send_fragments(&mut sender, 3000);
+        }
+        let new_fragments = send_fragments(&mut sender, 3000);
+        receiver.receive_packet(&new_fragments[0], |_, _| true);
+        let records = capture::records(|| receiver.receive_packet(&old_fragments[0], |_, _| true));
+        assert_logged_at_debug(&records, "could not insert in reassembly buffer");
+
+        // fragment whose count disagrees with the reassembly in progress
+
+        let mut three_fragments = Endpoint::new(test_config("sender-a"), time);
+        let mut two_fragments = Endpoint::new(test_config("sender-b"), time);
+        let mut receiver = Endpoint::new(test_config("receiver"), time);
+        let fragments_a = send_fragments(&mut three_fragments, 3000);
+        let fragments_b = send_fragments(&mut two_fragments, 2000);
+        assert_eq!(fragments_a.len(), 3);
+        assert_eq!(fragments_b.len(), 2);
+        receiver.receive_packet(&fragments_a[0], |_, _| true);
+        let records = capture::records(|| receiver.receive_packet(&fragments_b[1], |_, _| true));
+        assert_logged_at_debug(&records, "fragment count mismatch");
+
+        // fragment received twice
+
+        let mut sender = Endpoint::new(test_config("sender"), time);
+        let mut receiver = Endpoint::new(test_config("receiver"), time);
+        let fragments = send_fragments(&mut sender, 3000);
+        receiver.receive_packet(&fragments[0], |_, _| true);
+        let records = capture::records(|| receiver.receive_packet(&fragments[0], |_, _| true));
+        assert_logged_at_debug(&records, "fragment already received");
     }
 }

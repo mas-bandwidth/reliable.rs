@@ -4,13 +4,9 @@
 WHAT: Rust port of mas-bandwidth/reliable, the C packet fragmentation/ack library.
 NOT mas-bandwidth/reliable (the C reference), NOT reliable.go (the Go port).
 
-PUBLISHING (crates.io) — the token is NOT on this bench
-The crates.io token lives at /Users/glenn/.cargo/credentials.toml on GLENN'S personal
-macOS account: mode 0600, owned by glenn, unreadable from the mas account. `cargo publish`
-here fails with "no token found". That is NOT a missing credential and NOT a reason to
-mint a new one — it is the wrong machine account. Either Glenn publishes from his own
-account, or he moves the token into the mas keychain with the prompting form
-(`security add-generic-password -U -a rowan -s crates-io-token -w`, no value after -w).
+PUBLISHING (crates.io) — done by hand by the crate owner
+`cargo publish` here has no crates.io token, so publishing is done by the crate owner
+from their own environment. A missing token is not a missing credential to mint.
 
 STATE as verified 2026-09-13: crates.io has `reliable` 1.3.4 (published 2026-07-12) while
 Cargo.toml here is at 1.4.5. So this is a publish-UPDATE and the crate name is already
@@ -24,10 +20,10 @@ ours — no name trap. `cargo publish --dry-run` packages and compiles clean.
 **reliable.rs** is the Rust port of the C library
 [reliable](https://github.com/mas-bandwidth/reliable) — a packet acknowledgement system
 for UDP-based protocols (acks, fragmentation/reassembly, rtt/jitter/packet-loss/bandwidth
-stats). Published on crates.io as `reliable`. The library is ~1,600 lines across
-`src/lib.rs` (constants, sequence math), `src/sequence_buffer.rs`, `src/packet.rs`
-(header codec), and `src/endpoint.rs` (the endpoint, plus the C test suite ported
-one-for-one at the bottom).
+stats). Published on crates.io as `reliable`. The library is ~2,500 lines including its
+unit tests across `src/lib.rs` (constants, sequence math), `src/sequence_buffer.rs`,
+`src/packet.rs` (header codec), and `src/endpoint.rs` (the endpoint, plus tests ported
+and adapted from the C test suite at the bottom).
 
 Build and test:
 
@@ -56,8 +52,8 @@ in the library; the only unsafe in the repo is FFI in the `wire-compat` test cra
    duplicate, size checks before both), counter increment points, log levels, the two
    sequence-buffer insert orderings (`insert` = stale-check first for sent/received,
    `insert_advance_first` = advance-check first for reassembly), and the stats
-   smoothing formulas are all faithful ports. The ported tests in `endpoint.rs` are
-   kept line-for-line diffable against upstream's; don't "modernize" them.
+   smoothing formulas are all faithful ports. The tests ported from upstream in
+   `endpoint.rs` are kept close to their C originals; don't "modernize" them.
 
 ## Design contract (carried over from the C library — do not "fix")
 

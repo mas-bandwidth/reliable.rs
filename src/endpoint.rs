@@ -2433,4 +2433,128 @@ mod tests {
         assert!(rtt_min >= 0.0 && rtt_min <= rtt_avg && rtt_avg <= rtt_max);
         assert!(rtt_max < 1000.0); // rtt is in milliseconds
     }
+
+    // captures log records on the current thread only, so tests running in parallel
+    // neither see each other's records nor pay for formatting when not capturing
+
+    mod capture {
+        use std::cell::RefCell;
+        use std::sync::Once;
+
+        thread_local! {
+            static RECORDS: RefCell<Option<Vec<(log::Level, String)>>> = const { RefCell::new(None) };
+        }
+
+        struct CaptureLogger;
+
+        impl log::Log for CaptureLogger {
+            fn enabled(&self, _: &log::Metadata) -> bool {
+                RECORDS.with(|r| r.borrow().is_some())
+            }
+
+            fn log(&self, record: &log::Record) {
+                RECORDS.with(|r| {
+                    if let Some(records) = r.borrow_mut().as_mut() {
+                        records.push((record.level(), record.args().to_string()));
+                    }
+                });
+            }
+
+            fn flush(&self) {}
+        }
+
+        static LOGGER: CaptureLogger = CaptureLogger;
+        static INIT: Once = Once::new();
+
+        pub fn records(f: impl FnOnce()) -> Vec<(log::Level, String)> {
+            INIT.call_once(|| {
+                log::set_logger(&LOGGER).expect("no other logger is installed in tests");
+                log::set_max_level(log::LevelFilter::Trace);
+            });
+            RECORDS.with(|r| *r.borrow_mut() = Some(Vec::new()));
+            f();
+            RECORDS.with(|r| r.borrow_mut().take().expect("capture records"))
+        }
+    }
+
+    fn assert_logged_at_debug(records: &[(log::Level, String)], message: &str) {
+        assert!(
+            records
+                .iter()
+                .any(|(level, text)| *level == log::Level::Debug && text.contains(message)),
+            "expected a debug record containing {message:?}, got {records:?}"
+        );
+        assert!(
+            records.iter().all(|(level, _)| *level != log::Level::Error),
+            "expected no error records, got {records:?}"
+        );
+    }
+
+    fn send_fragments(sender: &mut Endpoint, packet_bytes: usize) -> Vec<Vec<u8>> {
+        let packet_data = vec![0x5a; packet_bytes];
+        let mut fragments = Vec::new();
+        sender.send_packet(&packet_data, |_, data| fragments.push(data.to_vec()));
+        fragments
+    }
+
+    #[test]
+    fn ordinary_receive_events_log_at_debug() {
+        let time = 1000.0;
+
+        // payload above max_packet_size, inside the receive gate
+
+        let mut receiver = Endpoint::new(test_config("receiver"), time);
+        let mut packet = vec![0u8; MAX_PACKET_HEADER_BYTES];
+        let header_bytes = write_packet_header(&mut packet, 0, 0, 0);
+        packet.truncate(header_bytes);
+        packet.resize(header_bytes + receiver.config.max_packet_size + 1, 0x5a);
+        let records = capture::records(|| receiver.receive_packet(&packet, |_, _| true));
+        assert_logged_at_debug(&records, "packet too large to receive");
+        assert_eq!(receiver.counters().num_packets_too_large_to_receive, 1);
+
+        // packet rejected by the process closure
+
+        let mut sender = Endpoint::new(test_config("sender"), time);
+        let mut receiver = Endpoint::new(test_config("receiver"), time);
+        let mut packets = Vec::new();
+        sender.send_packet(&[1, 2, 3], |_, data| packets.push(data.to_vec()));
+        let records = capture::records(|| receiver.receive_packet(&packets[0], |_, _| false));
+        assert_logged_at_debug(&records, "process packet failed");
+
+        // fragment of a packet too old for the reassembly buffer
+
+        let mut sender = Endpoint::new(test_config("sender"), time);
+        let mut receiver = Endpoint::new(test_config("receiver"), time);
+        let reassembly_size = receiver.config.fragment_reassembly_buffer_size;
+        let old_fragments = send_fragments(&mut sender, 3000);
+        for _ in 1..reassembly_size {
+            send_fragments(&mut sender, 3000);
+        }
+        let new_fragments = send_fragments(&mut sender, 3000);
+        receiver.receive_packet(&new_fragments[0], |_, _| true);
+        let records = capture::records(|| receiver.receive_packet(&old_fragments[0], |_, _| true));
+        assert_logged_at_debug(&records, "could not insert in reassembly buffer");
+
+        // fragment whose count disagrees with the reassembly in progress
+
+        let mut three_fragments = Endpoint::new(test_config("sender-a"), time);
+        let mut two_fragments = Endpoint::new(test_config("sender-b"), time);
+        let mut receiver = Endpoint::new(test_config("receiver"), time);
+        let fragments_a = send_fragments(&mut three_fragments, 3000);
+        let fragments_b = send_fragments(&mut two_fragments, 2000);
+        assert_eq!(fragments_a.len(), 3);
+        assert_eq!(fragments_b.len(), 2);
+        receiver.receive_packet(&fragments_a[0], |_, _| true);
+        let records = capture::records(|| receiver.receive_packet(&fragments_b[1], |_, _| true));
+        assert_logged_at_debug(&records, "fragment count mismatch");
+
+        // fragment received twice
+
+        let mut sender = Endpoint::new(test_config("sender"), time);
+        let mut receiver = Endpoint::new(test_config("receiver"), time);
+        let fragments = send_fragments(&mut sender, 3000);
+        receiver.receive_packet(&fragments[0], |_, _| true);
+        let records = capture::records(|| receiver.receive_packet(&fragments[0], |_, _| true));
+        assert_logged_at_debug(&records, "fragment already received");
+    }
 }

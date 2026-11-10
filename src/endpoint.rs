@@ -38,15 +38,15 @@ pub struct Config {
     ///
     /// Packet loss is sampled over the oldest `sent_packets_buffer_size / 2` entries, so
     /// a value below 4 measures it over at most one packet, and a value of 1 never
-    /// measures it (it reads 0). Sent and acked bandwidth are sampled over the oldest
-    /// half of the rounded buffer and need two samples, so a value of 1 or 2 never
-    /// measures them (they read 0).
+    /// measures it (it reads 0). Sent and acked bandwidth are sampled over the same
+    /// entries and need two samples, so a value below 4 never measures them (they
+    /// read 0).
     pub sent_packets_buffer_size: usize,
     /// Number of received packets tracked. Also the window for stale and duplicate packet
     /// rejection. Rounded up to a power of two.
     ///
-    /// Received bandwidth is sampled over the oldest half of the rounded buffer and needs
-    /// two samples, so a value of 1 or 2 never measures it (it reads 0).
+    /// Received bandwidth is sampled over the oldest `received_packets_buffer_size / 2`
+    /// entries and needs two samples, so a value below 4 never measures it (it reads 0).
     pub received_packets_buffer_size: usize,
     /// Number of packets that can be under reassembly from fragments at the same time.
     /// Rounded up to a power of two.
@@ -215,12 +215,13 @@ impl FragmentReassemblyData {
 
 fn smoothed_bandwidth_kbps<T: Default>(
     buffer: &SequenceBuffer<T>,
+    buffer_size: usize,
     current_kbps: f32,
     smoothing_factor: f32,
     sample: impl Fn(&T) -> Option<(f64, u32)>,
 ) -> f32 {
-    let base_sequence = buffer.sequence().wrapping_sub(buffer.num_entries() as u16);
-    let num_samples = buffer.num_entries() / 2;
+    let base_sequence = buffer.sequence().wrapping_sub(buffer_size as u16);
+    let num_samples = buffer_size / 2;
     let mut bytes_sent: u64 = 0;
     let mut start_time: Option<f64> = None;
     let mut finish_time = 0.0;
@@ -956,6 +957,7 @@ impl Endpoint {
 
         self.sent_bandwidth_kbps = smoothed_bandwidth_kbps(
             &self.sent_packets,
+            self.config.sent_packets_buffer_size,
             self.sent_bandwidth_kbps,
             self.config.bandwidth_smoothing_factor,
             |packet| Some((packet.time, packet.packet_bytes)),
@@ -963,6 +965,7 @@ impl Endpoint {
 
         self.received_bandwidth_kbps = smoothed_bandwidth_kbps(
             &self.received_packets,
+            self.config.received_packets_buffer_size,
             self.received_bandwidth_kbps,
             self.config.bandwidth_smoothing_factor,
             |packet| Some((packet.time, packet.packet_bytes)),
@@ -970,6 +973,7 @@ impl Endpoint {
 
         self.acked_bandwidth_kbps = smoothed_bandwidth_kbps(
             &self.sent_packets,
+            self.config.sent_packets_buffer_size,
             self.acked_bandwidth_kbps,
             self.config.bandwidth_smoothing_factor,
             |packet| packet.acked.then_some((packet.time, packet.packet_bytes)),
@@ -2369,6 +2373,67 @@ mod tests {
 
         let window_packets = 32.0_f64;
         let window_seconds = 31.0 * delta_time;
+        let header_bytes = config.packet_header_size as f64;
+        let sent_bytes = window_packets * (header_bytes + payload.len() as f64);
+        let received_bytes = window_packets * (header_bytes + 4.0 + ack_payload.len() as f64);
+
+        let expected_sent = (sent_bytes * 8.0 / 1000.0 / window_seconds) as f32;
+        let expected_received = (received_bytes * 8.0 / 1000.0 / window_seconds) as f32;
+
+        let bandwidth = sender.bandwidth();
+
+        assert!((bandwidth.sent_kbps - expected_sent).abs() < 0.01);
+        assert!((bandwidth.received_kbps - expected_received).abs() < 0.01);
+        assert!((bandwidth.acked_kbps - expected_sent).abs() < 0.01);
+    }
+
+    // C samples bandwidth over the oldest half of the configured buffer size, the same
+    // window it samples packet loss over, not over the rounded-up capacity
+
+    #[test]
+    fn bandwidth_statistics_non_power_of_two_buffer_size() {
+        let mut config = test_config("sender");
+        config.sent_packets_buffer_size = 100;
+        config.received_packets_buffer_size = 100;
+        config.bandwidth_smoothing_factor = 1.0;
+
+        let mut time = 100.0;
+
+        let mut sender = Endpoint::new(config.clone(), time);
+        let mut receiver = Endpoint::new(test_config("receiver"), time);
+
+        let payload = [0u8; 100];
+        let ack_payload = [0u8; 100];
+
+        let delta_time = 0.01;
+        let num_packets = 200usize;
+
+        for _ in 0..num_packets {
+            time += delta_time;
+
+            sender.update(time);
+            receiver.update(time);
+
+            sender.send_packet(&payload, |_, data| {
+                receiver.receive_packet(data, |_, _| true);
+            });
+
+            receiver.send_packet(&ack_payload, |_, data| {
+                sender.receive_packet(data, |_, _| true);
+            });
+
+            sender.update(time);
+            receiver.update(time);
+
+            sender.clear_acks();
+            receiver.clear_acks();
+        }
+
+        // the window is the oldest half of the configured 100 entries: 50 packets
+        // spanning 49 intervals, although the buffers hold 128
+
+        let window_packets = 50.0_f64;
+        let window_seconds = 49.0 * delta_time;
         let header_bytes = config.packet_header_size as f64;
         let sent_bytes = window_packets * (header_bytes + payload.len() as f64);
         let received_bytes = window_packets * (header_bytes + 4.0 + ack_payload.len() as f64);

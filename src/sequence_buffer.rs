@@ -31,6 +31,7 @@ impl<T: Default> SequenceBuffer<T> {
         self.sequence
     }
 
+    #[cfg(test)]
     pub fn num_entries(&self) -> usize {
         self.entries.len()
     }

@@ -2,6 +2,36 @@
 
 Versions track the upstream C library.
 
+## Unreleased
+
+Behaviour changes on main since 1.4.5, each matching the C reference at main. Nothing
+on the wire changes.
+
+- **Tracking buffer sizes are capped at 16384.** `Endpoint::new` panics if
+  `sent_packets_buffer_size`, `received_packets_buffer_size` or
+  `fragment_reassembly_buffer_size` is above 16384.
+- **Tracking buffer sizes round up to a power of two**, at most 16384, as in C, so each
+  slot maps to the same sequence numbers on every pass through the 16-bit sequence
+  space. The stale and duplicate window, and the reassembly memory bound, can be up to
+  twice the configured value.
+- **Statistics are sampled over the configured buffer size.** Packet loss and sent,
+  received and acked bandwidth all use the oldest `size / 2` entries of the configured
+  size, not of the rounded capacity.
+- **Smoothing factors are validated.** `Endpoint::new` panics if
+  `rtt_smoothing_factor`, `packet_loss_smoothing_factor` or
+  `bandwidth_smoothing_factor` is outside `[0.0, 1.0]`, including `NaN`.
+- **An empty received datagram is counted, not a panic.** `receive_packet` with empty
+  data increments `num_packets_invalid` and returns.
+- **A negative rtt sample is clamped to zero.** If the caller's clock steps backwards
+  between send and ack, the sample is recorded as 0 instead of tripping a debug
+  assertion.
+- **A fragment that cannot be stored is counted as invalid, not as received.** It logs
+  at error level, counts in `num_fragments_invalid` and is dropped, and no longer counts
+  in `num_fragments_received`.
+- **Ordinary receive events log at debug level.** A packet too large to receive, a
+  packet the `process` closure rejects, a stale fragment, a fragment count mismatch and
+  a fragment already received now log at debug rather than error.
+
 ## 1.4.5 (2026-09-13)
 
 Tracks C reliable 1.4.5. The vendored reference in `wire-compat/c/` moves from 1.3.4 to
@@ -151,7 +181,7 @@ drifts from upstream.
   every log that prints the name prints exactly its bytes. There is nothing to run off
   the end of.
 
-Publishing to crates.io is done by hand from Glenn's account.
+Publishing to crates.io is done by hand from the owner's account.
 
 ## 1.3.4 (2026-07-12)
 

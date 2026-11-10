@@ -179,7 +179,7 @@ impl FragmentReassemblyData {
         fragment_id: usize,
         fragment_size: usize,
         mut fragment_data: &[u8],
-    ) {
+    ) -> bool {
         if fragment_id == 0 {
             let mut packet_header = [0u8; MAX_PACKET_HEADER_BYTES];
             let packet_header_bytes =
@@ -205,10 +205,11 @@ impl FragmentReassemblyData {
                 end_offset,
                 self.packet_data.len()
             );
-            return;
+            return false;
         }
 
         self.packet_data[offset..end_offset].copy_from_slice(fragment_data);
+        true
     }
 }
 
@@ -749,17 +750,17 @@ impl Endpoint {
                 fragment_header.num_fragments
             );
 
-            reassembly_data.num_fragments_received += 1;
-            reassembly_data.fragment_received[fragment_header.fragment_id] = true;
-
-            reassembly_data.store_fragment(
+            if reassembly_data.store_fragment(
                 fragment_header.sequence,
                 fragment_header.ack,
                 fragment_header.ack_bits,
                 fragment_header.fragment_id,
                 self.config.fragment_size,
                 &packet_data[fragment_header.bytes..],
-            );
+            ) {
+                reassembly_data.num_fragments_received += 1;
+                reassembly_data.fragment_received[fragment_header.fragment_id] = true;
+            }
 
             if reassembly_data.num_fragments_received == reassembly_data.num_fragments_total {
                 debug!(
@@ -1882,6 +1883,59 @@ mod tests {
         assert!(final_packet_delivered);
         assert_eq!(receiver.counters().num_packets_received, num_packets_sent);
         assert_eq!(receiver.counters().num_fragments_invalid, 0);
+    }
+
+    #[test]
+    fn store_fragment_rejects_out_of_bounds_fragment() {
+        let mut reassembly_data = FragmentReassemblyData {
+            num_fragments_total: 2,
+            packet_data: vec![0; MAX_PACKET_HEADER_BYTES],
+            ..Default::default()
+        };
+
+        assert!(!reassembly_data.store_fragment(0, 0, 0, 1, 1024, &[0; 1024]));
+    }
+
+    #[test]
+    fn store_fragment_accepts_in_bounds_fragment() {
+        let mut reassembly_data = FragmentReassemblyData {
+            num_fragments_total: 2,
+            packet_data: vec![0; MAX_PACKET_HEADER_BYTES + 2 * 1024],
+            ..Default::default()
+        };
+
+        assert!(reassembly_data.store_fragment(0, 0, 0, 1, 1024, &[0; 1024]));
+    }
+
+    #[test]
+    fn rejected_fragment_does_not_count_as_received() {
+        let mut receiver = Endpoint::new(test_config("receiver"), 100.0);
+
+        let sequence = 0;
+        let fragment_id = 1;
+        let num_fragments = 2;
+        let reassembly_data = receiver
+            .fragment_reassembly
+            .insert_advance_first(sequence)
+            .expect("reassembly data");
+        reassembly_data.num_fragments_total = num_fragments;
+        reassembly_data.packet_data = vec![0; MAX_PACKET_HEADER_BYTES];
+
+        let fragment_size = receiver.config().fragment_size;
+        let mut packet = vec![0u8; FRAGMENT_HEADER_BYTES + fragment_size];
+        packet[0] = 1;
+        packet[1..3].copy_from_slice(&sequence.to_le_bytes());
+        packet[3] = fragment_id as u8;
+        packet[4] = (num_fragments - 1) as u8;
+
+        receiver.receive_packet(&packet, |_, _| true);
+
+        let reassembly_data = receiver
+            .fragment_reassembly
+            .find(sequence)
+            .expect("reassembly data");
+        assert_eq!(reassembly_data.num_fragments_received, 0);
+        assert!(!reassembly_data.fragment_received[fragment_id]);
     }
 
     #[test]

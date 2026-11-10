@@ -10,7 +10,6 @@
 //! Run with: cargo +nightly fuzz run fuzz_endpoint
 
 #![no_main]
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use libfuzzer_sys::fuzz_target;
 use reliable::{Config, Endpoint};

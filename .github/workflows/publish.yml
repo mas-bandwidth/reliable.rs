@@ -6,6 +6,12 @@ name: publish
 on:
   push:
     tags: ['v[0-9]+.[0-9]+.[0-9]+']
+  # By hand, to publish an existing release tag that predates this workflow.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: release tag to publish (vX.Y.Z)
+        required: true
 
 permissions:
   contents: read
@@ -21,20 +27,24 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7
         with:
+          ref: ${{ inputs.tag || github.ref }}
           persist-credentials: false
 
       - run: rustup toolchain install stable --profile minimal && rustup default stable
 
       - name: Check the tag matches the manifest version
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
           set -eu
           version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
-          tag_version="${GITHUB_REF_NAME#v}"
+          tag="${INPUT_TAG:-$GITHUB_REF_NAME}"
+          tag_version="${tag#v}"
           if [ "$tag_version" != "$version" ]; then
-            echo "::error::tag $GITHUB_REF_NAME does not match version $version in Cargo.toml"
+            echo "::error::tag $tag does not match version $version in Cargo.toml"
             exit 1
           fi
-          echo "tag $GITHUB_REF_NAME matches Cargo.toml version $version"
+          echo "tag $tag matches Cargo.toml version $version"
 
       - name: Publish
         env:

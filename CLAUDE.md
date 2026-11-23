@@ -89,6 +89,10 @@ credentials). The `reliable` crate name belongs to the owner's account. Delibera
 publishing via GitHub OIDC, a second crate owner, and a cross-link from the C repo's
 README to this port.
 
+Pushing a `vX.Y.Z` tag runs `.github/workflows/publish.yml`, which publishes to crates.io
+when the `CRATES_IO_TOKEN` secret exists (an org secret in mas-bandwidth); without it the
+workflow skips the upload and the owner publishes by hand.
+
 ## Status (2026-09-13)
 
 1.4.5 prepared: the vendored C reference is at 1.4.5, the port carries every upstream

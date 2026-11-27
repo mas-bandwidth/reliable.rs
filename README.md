@@ -128,7 +128,7 @@ cargo test
 
 The minimum supported Rust version is 1.88. The crate contains no unsafe code (`#![forbid(unsafe_code)]`) and its only dependency is the [`log`](https://crates.io/crates/log) facade.
 
-The test suite includes the C library's tests ported one for one, plus bounded runs of its soak harness (randomly sized fragmented packets over a lossy link, contents validated) and its fuzz harness (loss, reordering, duplication, bit corruption and random packet injection over a simulated link).
+The test suite includes tests ported and adapted from the C library, plus bounded runs of its soak harness (randomly sized fragmented packets over a lossy link, contents validated) and its fuzz harness (loss, reordering, duplication, bit corruption and random packet injection over a simulated link).
 
 The C repo's example programs are ported under [examples](examples):
 

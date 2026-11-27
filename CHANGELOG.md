@@ -2,10 +2,10 @@
 
 Versions track the upstream C library.
 
-## Unreleased
+## 1.4.6 (2026-11-27)
 
-Behaviour changes on main since 1.4.5, each matching the C reference at main. Nothing
-on the wire changes.
+Carries the behaviour changes of C reliable 1.4.6. Nothing on the wire changes; the
+vendored wire-compatibility reference in `wire-compat/c/` stays at 1.4.5.
 
 - **Tracking buffer sizes are capped at 16384.** `Endpoint::new` panics if
   `sent_packets_buffer_size`, `received_packets_buffer_size` or
